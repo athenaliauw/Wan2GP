@@ -2437,7 +2437,7 @@ def get_model_name(model_type, description_container = [""]):
     return model_name
 
 def get_model_record(model_name):
-    return f"WanGP v{WanGP_version} by DeepBeepMeep - " +  model_name
+    return f"WanGP v{WanGP_version} clone from DeepBeepMeep - by AthenaLiauw" +  model_name
 
 def get_model_recursive_prop(model_type, prop = "URLs", sub_prop_name = None, return_list = True,  stack= []):
     model_def = models_def.get(model_type, None)
