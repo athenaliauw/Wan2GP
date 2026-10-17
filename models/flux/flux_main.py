@@ -1,3 +1,4 @@
+from shared.utils.phase_progress import generation_progress, set_phase_status
 import os
 import re
 import time
@@ -83,7 +84,7 @@ class model_factory:
         save_quantized = False,
         dtype = torch.bfloat16,
         VAE_dtype = torch.float32,
-        mixed_precision_transformer = False
+        mixed_precision_transformer = False,
     ):
         self.device = torch.device(f"cuda")
         self._interrupt = False
@@ -124,7 +125,7 @@ class model_factory:
             with torch.device("meta"):
                 self.vae  = AutoencoderKLFlux2(AutoEncoderParamsFlux2())
 
-            offload.load_model_data(self.vae, fl.locate_file("flux2_vae.safetensors"), writable_tensors= False, )
+            offload.load_model_data(self.vae, fl.locate_file("flux2_vae.safetensors"), writable_tensors=False, default_dtype=None)
             self.vae_scale_factor = 8
         else:
             self.t5 = load_t5(torch_device, text_encoder_filename, max_length=512)
@@ -140,14 +141,19 @@ class model_factory:
                 torch_device,
                 preprocess_sd=preprocess_flux_state_dict,
             )
-            self.model_def = model_def 
+            self.model_def = model_def
             self.vae = None if getattr(self.model, "radiance", False) else load_ae(self.name, device=torch_device)
 
         siglip_processor = siglip_model = feature_embedder = None
         if self.name == 'flux-dev-uso':
             siglip_path =  fl.locate_folder("siglip-so400m-patch14-384")
             siglip_processor = SiglipImageProcessor.from_pretrained(siglip_path)
-            siglip_model = SiglipVisionModel.from_pretrained(siglip_path)
+            siglip_model = offload.fast_load_transformers_model(
+                fl.locate_file(os.path.join("siglip-so400m-patch14-384", "model.safetensors")),
+                modelClass=SiglipVisionModel,
+                defaultConfigPath=fl.locate_file(os.path.join("siglip-so400m-patch14-384", "vision_config.json")),
+                writable_tensors=False,
+            )
             siglip_model.eval().to("cpu")
             if len(model_filename) > 1:
                 from .modules.layers import SigLIPMultiFeatProjModel                
@@ -158,14 +164,14 @@ class model_factory:
                     hidden_size=3072, #self.hidden_size,
                     context_layer_norm=True,
                 )
-                offload.load_model_data(feature_embedder, model_filename[1])
+                offload.load_model_data(feature_embedder, model_filename[1], writable_tensors=False, default_dtype=None)
         self.vision_encoder = siglip_model
         self.vision_encoder_processor = siglip_processor
         self.feature_embedder = feature_embedder
 
         if self.name in ['flux-dev-kontext-dreamomni2']:
             self.processor = Qwen2VLProcessor.from_pretrained(fl.locate_folder("Qwen2.5-VL-7B-DreamOmni2"))
-            self.vlm_model = offload.fast_load_transformers_model(fl.locate_file( os.path.join("Qwen2.5-VL-7B-DreamOmni2","Qwen2.5-VL-7B-DreamOmni2_quanto_bf16_int8.safetensors")),  writable_tensors= True , modelClass=Qwen2_5_VLForConditionalGeneration,  defaultConfigPath= fl.locate_file(os.path.join("Qwen2.5-VL-7B-DreamOmni2", "config.json")))
+            self.vlm_model = offload.fast_load_transformers_model(fl.locate_file( os.path.join("Qwen2.5-VL-7B-DreamOmni2","Qwen2.5-VL-7B-DreamOmni2_quanto_bf16_int8.safetensors")),  writable_tensors= False , modelClass=Qwen2_5_VLForConditionalGeneration,  defaultConfigPath= fl.locate_file(os.path.join("Qwen2.5-VL-7B-DreamOmni2", "config.json")))
         else:
             self.processor = None
             self.vlm_model = None
@@ -242,6 +248,7 @@ class model_factory:
         return output_text[0]
 
     
+    @generation_progress
     def generate(
             self,
             seed: int | None = None,
@@ -264,6 +271,8 @@ class model_factory:
             image_refs_relative_size = 100,
             denoising_strength = 1.,
             masking_strength = 1.,
+            vae_upsampler = None,
+            set_progress_status=None,
             **bbargs
     ):
             if self._interrupt:
@@ -271,6 +280,15 @@ class model_factory:
             device="cuda"
             flux2 = self.is_flux2
             model_mode = bbargs.get("model_mode", None)
+            def _vae_upsampler_progress(_phase, current_step=None, total_steps=None):
+                if callable(set_progress_status):
+                    progress_label = getattr(vae_upsampler, "progress_label", "VAE Spatial Upsampling")
+                    if current_step is None or total_steps is None:
+                        set_progress_status(f"{progress_label} in Progress")
+                    else:
+                        total_steps = int(total_steps)
+                        step_no = min(int(current_step) + 1, total_steps)
+                        set_progress_status(f"{progress_label} in Progress ({step_no}/{total_steps})")
             model_mode_int = None
             if model_mode is not None:
                 try:
@@ -278,10 +296,29 @@ class model_factory:
                 except (TypeError, ValueError):
                     model_mode_int = None
             lanpaint_enabled = model_mode_int in (2, 3, 4, 5)
-            if flux2:
-                guide_scale = 1.0
             if self.guidance_max_phases < 1: guide_scale = 1
             if n_prompt is None or len(n_prompt) == 0: n_prompt = "low quality, ugly, unfinished, out of focus, deformed, disfigure, blurry, smudged, restricted palette, flat colors"
+            nag_scale = bbargs.get("NAG_scale", 1.0)
+            nag_tau = bbargs.get("NAG_tau", 3.5)
+            nag_alpha = bbargs.get("NAG_alpha", 0.5)
+            NAG = None
+            if nag_scale > 1 and guide_scale <= 1:
+                NAG = {"scale": nag_scale, "tau": nag_tau, "alpha": nag_alpha, "prefix_len": 0}
+            def _align_seq_len(tensor, target_len):
+                if tensor is None:
+                    return tensor
+                seq_dim = 0 if tensor.dim() == 2 else 1
+                cur_len = tensor.shape[seq_dim]
+                if cur_len == target_len:
+                    return tensor
+                if cur_len < target_len:
+                    pad_len = target_len - cur_len
+                    if seq_dim == 0:
+                        pad = tensor[-1:].repeat(pad_len, 1)
+                        return torch.cat([tensor, pad], dim=0)
+                    pad = tensor[:, -1:, :].repeat(1, pad_len, 1)
+                    return torch.cat([tensor, pad], dim=1)
+                return tensor.narrow(seq_dim, 0, target_len)
             flux_dev_uso = self.name in ['flux-dev-uso']
             flux_dev_umo = self.name in ['flux-dev-umo']
             radiance = self.name in ['flux-chroma-radiance']
@@ -296,12 +333,31 @@ class model_factory:
                 randn = torch.randn(shape, generator=generator, dtype=torch.bfloat16, device="cuda")
                 img, img_ids = batched_prc_img(randn)                
                 encode_fn = lambda prompts: list(zip(*batched_prc_txt(self.mistral(prompts).to(torch.bfloat16))))
-                txt_embeds, txt_ids = self.text_encoder_cache.encode(encode_fn, [input_prompt], device=self.device)[0]
+                prompts_to_encode = [input_prompt, n_prompt] if NAG is not None or guide_scale != 1 else [input_prompt]
+                contexts = self.text_encoder_cache.encode(encode_fn, prompts_to_encode, device=self.device)
+                txt_embeds, txt_ids = contexts[0]
+                if NAG is not None:
+                    neg_embeds, neg_ids = contexts[1]
+                    if txt_embeds.dim() == 2:
+                        txt_embeds = txt_embeds.unsqueeze(0)
+                        txt_ids = txt_ids.unsqueeze(0)
+                    if neg_embeds.dim() == 2:
+                        neg_embeds = neg_embeds.unsqueeze(0)
+                        neg_ids = neg_ids.unsqueeze(0)
+                    pos_len = txt_embeds.shape[1]
+                    neg_embeds = _align_seq_len(neg_embeds, pos_len)
+                    neg_ids = _align_seq_len(neg_ids, pos_len)
+                    txt_embeds = torch.cat([txt_embeds, neg_embeds], dim=1)
+                    txt_ids = torch.cat([txt_ids, neg_ids], dim=1)
+                    NAG["cap_embed_len"] = pos_len
+                if txt_embeds.dim() == 2:
+                    txt_embeds = txt_embeds.unsqueeze(0)
+                    txt_ids = txt_ids.unsqueeze(0)
                 txt_embeds, txt_ids = txt_embeds.expand(batch_size, -1, -1), txt_ids.expand(batch_size, -1, -1)
                 vec = torch.zeros(batch_size, 1, device=device, dtype=self.dtype)
                 inp = { "img": img, "img_ids": img_ids, "txt": txt_embeds.to(device), "txt_ids": txt_ids.to(device), "vec": vec }
                 if guide_scale != 1:
-                    txt_embeds, txt_ids = self.text_encoder_cache.encode(encode_fn, [n_prompt], device=self.device)[0]
+                    txt_embeds, txt_ids = contexts[1]
                     txt_embeds, txt_ids = txt_embeds.expand(batch_size, -1, -1), txt_ids.expand(batch_size, -1, -1)
                     inp.update({ "neg_txt": txt_embeds.to(device), "neg_txt_ids": txt_ids.to(device), "neg_vec": vec })
 
@@ -316,9 +372,9 @@ class model_factory:
 
                 noise_patch_size = 2
                 if self.is_piflux2:
-                    timesteps = get_schedule_piflux2(sampling_steps, inp["img"].shape[1])
+                    timesteps = get_schedule_piflux2(sampling_steps, inp["img"].shape[1], device)
                 else:
-                    timesteps = get_schedule_flux2(sampling_steps, inp["img"].shape[1])
+                    timesteps = get_schedule_flux2(sampling_steps, inp["img"].shape[1], device)
                 unpack_latent = lambda x : self.vae.pre_decode(torch.cat(scatter_ids(x, inp["img_ids"])).squeeze(2))
                 ref_style_imgs = []
                 image_mask = None
@@ -403,18 +459,33 @@ class model_factory:
                 encode_fn = lambda prompts: [prepare_prompt(self.t5, self.clip, 1, prompt, device=device) for prompt in prompts]
                 prompt_list = [input_prompt] if isinstance(input_prompt, str) else input_prompt
                 prompt_bs = len(prompt_list) if batch_size == 1 and not isinstance(input_prompt, str) else batch_size
-                prompt_contexts = self.text_encoder_cache.encode(encode_fn, prompt_list, device=device)
+                negative_list = ([n_prompt] if isinstance(n_prompt, str) else n_prompt) if NAG is not None or guide_scale != 1 else []
+                contexts = self.text_encoder_cache.encode(encode_fn, prompt_list + negative_list, device=device)
+                prompt_contexts, negative_contexts = contexts[:len(prompt_list)], contexts[len(prompt_list):]
                 txt = torch.cat([ctx["txt"] for ctx in prompt_contexts], dim=0)
                 vec = torch.cat([ctx["vec"] for ctx in prompt_contexts], dim=0)
                 if txt.shape[0] == 1 and prompt_bs > 1:
                     txt = txt.repeat(prompt_bs, 1, 1)
                     vec = vec.repeat(prompt_bs, 1)
-                txt_ids = torch.zeros(prompt_bs, txt.shape[1], 3, device=device)
+                if NAG is not None:
+                    pos_len = txt.shape[1]
+                    neg_list = [n_prompt] if isinstance(n_prompt, str) else n_prompt
+                    neg_bs = len(neg_list) if batch_size == 1 and not isinstance(n_prompt, str) else batch_size
+                    neg_contexts = negative_contexts
+                    neg_txt = torch.cat([ctx["txt"] for ctx in neg_contexts], dim=0)
+                    if neg_txt.shape[0] == 1 and neg_bs > 1:
+                        neg_txt = neg_txt.repeat(neg_bs, 1, 1)
+                    neg_txt = _align_seq_len(neg_txt, pos_len)
+                    if neg_txt.shape[0] == 1 and txt.shape[0] > 1:
+                        neg_txt = neg_txt.repeat(txt.shape[0], 1, 1)
+                    txt = torch.cat([txt, neg_txt], dim=1)
+                    NAG["cap_embed_len"] = pos_len
+                txt_ids = torch.zeros(txt.shape[0], txt.shape[1], 3, device=device)
                 inp.update({"txt": txt.to(device), "txt_ids": txt_ids.to(device), "vec": vec.to(device)})
                 if guide_scale != 1:
                     neg_list = [n_prompt] if isinstance(n_prompt, str) else n_prompt
                     neg_bs = len(neg_list) if batch_size == 1 and not isinstance(n_prompt, str) else batch_size
-                    neg_contexts = self.text_encoder_cache.encode(encode_fn, neg_list, device=device)
+                    neg_contexts = negative_contexts
                     neg_txt = torch.cat([ctx["txt"] for ctx in neg_contexts], dim=0)
                     neg_vec = torch.cat([ctx["vec"] for ctx in neg_contexts], dim=0)
                     if neg_txt.shape[0] == 1 and neg_bs > 1:
@@ -423,16 +494,19 @@ class model_factory:
                     neg_txt_ids = torch.zeros(neg_bs, neg_txt.shape[1], 3, device=device)
                     inp.update({"neg_txt": neg_txt.to(device), "neg_txt_ids": neg_txt_ids.to(device), "neg_vec": neg_vec.to(device)})
 
-                timesteps = get_schedule(sampling_steps, inp["img"].shape[1], shift=(self.name != "flux-schnell"))
+                timesteps = get_schedule(sampling_steps, inp["img"].shape[1], shift=(self.name != "flux-schnell"), device=device)
 
                 ref_style_imgs = [self.vision_encoder_processor(img, return_tensors="pt").to(self.device) for img in ref_style_imgs]
                 if self.feature_embedder is not None and ref_style_imgs is not None and len(ref_style_imgs) > 0 and self.vision_encoder is not None:
                     # processing style feat into textural hidden space
+                    set_phase_status("Encoding Image Features")
                     siglip_embedding = [self.vision_encoder(**emb, output_hidden_states=True) for emb in ref_style_imgs]
                     siglip_embedding = torch.cat([self.feature_embedder(emb) for emb in siglip_embedding], dim=1)
-                    siglip_embedding_ids = torch.zeros( siglip_embedding.shape[0], siglip_embedding.shape[1], 3 ).to(device)
+                    siglip_embedding_ids = torch.zeros( siglip_embedding.shape[0], siglip_embedding.shape[1], 3, device=device)
                     inp["siglip_embedding"] = siglip_embedding
                     inp["siglip_embedding_ids"] = siglip_embedding_ids
+                    if NAG is not None:
+                        NAG["prefix_len"] = siglip_embedding.shape[1]
 
                 if radiance:
                     def unpack_latent(x):
@@ -441,6 +515,7 @@ class model_factory:
                     def unpack_latent(x):
                         return unpack(x.float(), height, width) 
 
+            del contexts
             # denoise initial noise
             x = denoise(
                 self.model,
@@ -460,27 +535,47 @@ class model_factory:
                 height=height,
                 width=width,
                 vae_scale_factor=8,
+                NAG=NAG,
             )
             if x==None: return None
             # decode latents to pixel space
+            vae_upsampler_lq_latent = torch.cat(scatter_ids(x, inp["img_ids"])).squeeze(2) if flux2 and vae_upsampler is not None else None
             x = unpack_latent(x)
             if self.vae is not None:
+                vae_latent = x
+                lq_latent = vae_upsampler_lq_latent if vae_upsampler_lq_latent is not None else vae_latent
                 with torch.autocast(device_type=device, dtype=torch.bfloat16):
-                    x = self.vae.decode(x)
+                    x = self.vae.decode(vae_latent)
 
-            img_msk_rebuilt = inp.get("img_msk_rebuilt") if isinstance(inp, dict) else None
-            if img_msk_rebuilt is not None and (lanpaint_enabled or (masking_strength == 1 and not flux2)):
-                img = None
-                if input_frames is not None:
-                    img = input_frames.squeeze(1).unsqueeze(0)
-                elif input_ref_images is not None and len(input_ref_images) > 0:
-                    img = convert_image_to_tensor(
-                        input_ref_images[0].resize((width, height), resample=Image.Resampling.LANCZOS)
-                    ).unsqueeze(0)
-                if img is not None:
-                    x = img * (1 - img_msk_rebuilt) + x.to(img) * img_msk_rebuilt
+                img_msk_rebuilt = inp.get("img_msk_rebuilt") if isinstance(inp, dict) else None
+                if img_msk_rebuilt is not None and (lanpaint_enabled or (masking_strength == 1 and not flux2)):
+                    img = None
+                    if input_frames is not None:
+                        img = input_frames.squeeze(1).unsqueeze(0)
+                    elif input_ref_images is not None and len(input_ref_images) > 0:
+                        img = convert_image_to_tensor(
+                            input_ref_images[0].resize((width, height), resample=Image.Resampling.LANCZOS)
+                        ).unsqueeze(0)
+                    if img is not None:
+                        x = img * (1 - img_msk_rebuilt) + x.to(img) * img_msk_rebuilt
 
-            x = x.clamp(-1, 1)
+                if vae_upsampler is not None:
+                    _vae_upsampler_progress(None)
+                    x_ref, lq_latent_ref = [x], [lq_latent]
+                    x = lq_latent = None
+                    x = vae_upsampler.decode_inputs(
+                        x_ref,
+                        lq_latent_ref,
+                        prompt=input_prompt,
+                        seed=seed,
+                        abort_callback=lambda: self._interrupt,
+                        progress_callback=_vae_upsampler_progress,
+                    )
+                    if x is None:
+                        return None
+
+            if x.dtype != torch.uint8:
+                x = x.clamp_(-1, 1).add_(1).mul_(127.5).round_().clamp_(0, 255).to(torch.uint8)
             x = x.transpose(0, 1)
             return x
 
@@ -489,7 +584,7 @@ class model_factory:
             resolved = fl.locate_file(lora_ref, error_if_none=False)
             if resolved is None:
                 resolved = fl.locate_file(os.path.basename(lora_ref))
-            return resolved
+            return os.path.abspath(resolved)
 
         preloadURLs = get_model_recursive_prop(model_type,  "preload_URLs")
         if self.is_piflux2:

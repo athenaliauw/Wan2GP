@@ -1,4 +1,4 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import NamedTuple
 
 import torch
@@ -157,6 +157,33 @@ class AudioLatentShape(NamedTuple):
 
 
 @dataclass(frozen=True)
+class TimestepCompressionPlan:
+    frame_mask: torch.Tensor | None = None
+    frame_indices: torch.Tensor | None = None
+
+
+@dataclass
+class LatentStateRuntimeCache:
+    timestep_plan: TimestepCompressionPlan | None = None
+    rope_caches: dict[tuple, object] = field(default_factory=dict)
+    base_timestep: torch.Tensor | None = None
+    prompt_base_timestep: torch.Tensor | None = None
+
+
+@dataclass(frozen=True)
+class GeneratedKeyframeLayout:
+    """Token range of generated keyframe slots: one latent frame of tokens per target pixel frame index."""
+
+    pixel_frame_indices: tuple[int, ...]
+    tokens_per_keyframe: int
+    first_token: int
+
+    @property
+    def token_slice(self) -> slice:
+        return slice(self.first_token, self.first_token + len(self.pixel_frame_indices) * self.tokens_per_keyframe)
+
+
+@dataclass(frozen=True)
 class LatentState:
     """
     State of latents during the diffusion denoising process.
@@ -165,12 +192,20 @@ class LatentState:
         denoise_mask: Mask encoding the denoising strength for each token (1 = full denoising, 0 = no denoising).
         positions: Positional indices for each latent element, used for positional embeddings.
         clean_latent: Initial state of the latent before denoising, may include conditioning latents.
+        attention_mask: Optional self-attention mask of shape (B, T, T). Values in [0, 1] where 1 = full attention.
+        generated_keyframe_layout: Locates generated keyframe slot tokens when they were appended (always last).
+        generated_keyframes: Denoised slot content ``(B, C, K, H, W)`` extracted by ``clear_conditioning``.
     """
 
     latent: torch.Tensor
     denoise_mask: torch.Tensor
     positions: torch.Tensor
     clean_latent: torch.Tensor
+    attention_mask: torch.Tensor | None = None
+    keyframes_mask: torch.Tensor | None = None
+    generated_keyframe_layout: GeneratedKeyframeLayout | None = None
+    generated_keyframes: torch.Tensor | None = None
+    runtime_cache: LatentStateRuntimeCache = field(default_factory=LatentStateRuntimeCache, compare=False, repr=False)
 
     def clone(self) -> "LatentState":
         return LatentState(
@@ -178,4 +213,8 @@ class LatentState:
             denoise_mask=self.denoise_mask.clone(),
             positions=self.positions.clone(),
             clean_latent=self.clean_latent.clone(),
+            attention_mask=self.attention_mask.clone() if self.attention_mask is not None else None,
+            keyframes_mask=self.keyframes_mask.clone() if self.keyframes_mask is not None else None,
+            generated_keyframe_layout=self.generated_keyframe_layout,
+            generated_keyframes=self.generated_keyframes,
         )

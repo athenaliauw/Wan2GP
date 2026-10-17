@@ -11,7 +11,7 @@ from ..ltx_core.loader import LoraPathStrengthAndSDOps
 from ..ltx_core.model.audio_vae import decode_audio as vae_decode_audio
 from ..ltx_core.model.upsampler import upsample_video
 from ..ltx_core.model.video_vae import TilingConfig, VideoEncoder, get_video_chunks_number
-from ..ltx_core.model.video_vae import decode_video as vae_decode_video
+from ..ltx_core.model.video_vae import decode_video_to_tensor as vae_decode_video_to_tensor
 from ..ltx_core.text_encoders.gemma import encode_text, postprocess_text_embeddings, resolve_text_connectors
 from ..ltx_core.tools import VideoLatentTools
 from ..ltx_core.types import LatentState, VideoPixelShape
@@ -35,7 +35,6 @@ from .utils.helpers import (
     simple_denoising_func,
     video_conditionings_by_keyframe,
 )
-from .utils.media_io import encode_video
 from .utils.types import PipelineComponents
 from shared.utils.loras_mutipliers import update_loras_slists
 from shared.utils.text_encoder_cache import TextEncoderCache
@@ -99,6 +98,7 @@ class ICLoraPipeline:
         frame_rate: float,
         images: list[tuple[str, int, float]],
         video_conditioning: list[tuple[str, float]],
+        alt_guidance_scale: float = 1.0,
         enhance_prompt: bool = False,
         audio_conditionings: list | None = None,
         tiling_config: TilingConfig | None = None,
@@ -110,6 +110,7 @@ class ICLoraPipeline:
         masking_strength: float | None = None,
     ) -> tuple[Iterator[torch.Tensor], torch.Tensor]:
         assert_resolution(height=height, width=width, is_two_stage=True)
+        alt_guidance_scale = 1.0
 
         generator = torch.Generator(device=self.device).manual_seed(seed)
         mask_generator = torch.Generator(device=self.device).manual_seed(int(seed) + 1)
@@ -179,12 +180,14 @@ class ICLoraPipeline:
                     video_context=video_context,
                     audio_context=audio_context,
                     transformer=transformer,  # noqa: F821
+                    alt_guidance_scale=alt_guidance_scale,
                 ),
                 mask_context=mask_context,
                 interrupt_check=interrupt_check,
                 callback=callback,
                 preview_tools=preview_tools,
                 pass_no=1,
+                transformer=transformer,
             )
 
         stage_1_output_shape = VideoPixelShape(
@@ -280,12 +283,14 @@ class ICLoraPipeline:
                     video_context=video_context,
                     audio_context=audio_context,
                     transformer=transformer,  # noqa: F821
+                    alt_guidance_scale=alt_guidance_scale,
                 ),
                 mask_context=mask_context,
                 interrupt_check=interrupt_check,
                 callback=callback,
                 preview_tools=preview_tools,
                 pass_no=2,
+                transformer=transformer,
             )
 
         stage_2_output_shape = VideoPixelShape(batch=1, frames=num_frames, width=width, height=height, fps=frame_rate)
@@ -337,7 +342,18 @@ class ICLoraPipeline:
         del video_encoder
         cleanup_memory()
 
-        decoded_video = vae_decode_video(video_state.latent, self.stage_2_model_ledger.video_decoder(), tiling_config)
+        video_latent = [video_state.latent]
+        video_state = None
+        decoded_video = vae_decode_video_to_tensor(
+            video_latent,
+            self.stage_2_model_ledger.video_decoder(),
+            tiling_config,
+            expected_frames=int(stage_2_output_shape.frames),
+            expected_height=int(stage_2_output_shape.height),
+            expected_width=int(stage_2_output_shape.width),
+            interrupt_check=interrupt_check,
+            generator=generator,
+        )
         decoded_audio = vae_decode_audio(
             audio_state.latent, self.stage_2_model_ledger.audio_decoder(), self.stage_2_model_ledger.vocoder()
         )
@@ -380,6 +396,8 @@ class ICLoraPipeline:
 
 @torch.inference_mode()
 def main() -> None:
+    from .utils.media_io import encode_video
+
     logging.getLogger().setLevel(logging.INFO)
     parser = default_2_stage_distilled_arg_parser()
     parser.add_argument(

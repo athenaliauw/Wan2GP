@@ -1,3 +1,4 @@
+from shared.utils.phase_progress import generation_progress
 import os
 import time
 import random
@@ -259,21 +260,17 @@ class Inference(object):
         from mmgp import offload
 
         source =  model_def.get("source", None)
-        kwargs_light = dict(do_quantize= quantizeTransformer and not save_quantized, pinToMemory = pinToMemory, partialPinning = partialPinning)
+        model.mixed_precision = mixed_precision_transformer
+        def pre_load_callback(model):
+            model.lock_layers_dtypes(torch.float32 if model.mixed_precision else dtype)
+        kwargs_light = dict(do_quantize= quantizeTransformer and not save_quantized, pinToMemory = pinToMemory, partialPinning = partialPinning, writable_tensors=False, default_dtype=dtype, pre_load_callback=pre_load_callback)
         if source is not None:
             from wgp import save_model
             offload.load_model_data(model, fl.locate_file(source),  **kwargs_light)
         else:
             offload.load_model_data(model, model_filepath, **kwargs_light)
 
-            
-        model.mixed_precision = mixed_precision_transformer
-
-        model.lock_layers_dtypes(torch.float32 if model.mixed_precision else dtype)
-        offload.change_dtype(model, dtype, True)
         model.eval().requires_grad_(False)
-
-        model.eval()
 
         if not source is None:
             save_model(model, model_type, dtype, None, submodel_no= 1)
@@ -328,7 +325,7 @@ class Inference(object):
                     config = json.load(f)
                 upsampler = upsampler_cls(**config)
                 upsampler.target_size = upsampler_target_size  
-                offload.load_model_data(upsampler, upsampler_checkpoint, writable_tensors= False)
+                offload.load_model_data(upsampler, upsampler_checkpoint, writable_tensors=False, default_dtype=None)
 
             vae_configpath = fl.locate_file("hunyuan_video_1_5_VAE.json")
             vae_filepath =  fl.locate_file("hunyuan_video_1_5_VAE_fp32.safetensors")
@@ -338,7 +335,7 @@ class Inference(object):
             from accelerate import init_empty_weights
             with init_empty_weights():
                 vae = AutoencoderKLConv3D(**config)
-            offload.load_model_data(vae, vae_filepath )
+            offload.load_model_data(vae, vae_filepath, writable_tensors=False, default_dtype=None)
             vae = vae.to("cpu")
             s_ratio = t_ratio = 1
             vae._model_dtype =  torch.float32 if VAE_dtype == torch.float32 else  torch.float16
@@ -451,6 +448,10 @@ class Inference(object):
             wav2vec._model_dtype = torch.float32
             wav2vec.requires_grad_(False)
         if avatar:
+            from models.hyvideo.data_kits.assets import query_download_def
+            from shared.utils.download import process_files_def_if_needed
+
+            process_files_def_if_needed(query_download_def())
             align_instance = AlignImage("cuda", det_path= fl.locate_file("det_align/detface.pt"))
             align_instance.facedet.model.to("cpu")
             adapt_model(model, "audio_adapter_blocks")
@@ -724,11 +725,13 @@ class HunyuanVideoSampler(Inference):
             use_real=True,
             theta_rescale_factor=1,
             L_test = (video_length - 1) // 4 + 1,
-            enable_riflex = enable_riflex
+            enable_riflex = enable_riflex,
+            device = self.device,
         )
         return freqs_cos, freqs_sin
 
 
+    @generation_progress
     def generate(
         self,
         input_prompt,
@@ -757,6 +760,7 @@ class HunyuanVideoSampler(Inference):
         cfg_star_switch = False,
         fit_into_canvas = True,
         conditioning_latents_size = 0,
+        set_progress_status=None,
         **kwargs,
     ):
 

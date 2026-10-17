@@ -28,7 +28,6 @@ class DTT2V:
         self,
         config,
         checkpoint_dir,
-        rank=0,
         model_filename = None,
         model_type = None,
         model_def = None,
@@ -42,7 +41,6 @@ class DTT2V:
     ):
         self.device = torch.device(f"cuda")
         self.config = config
-        self.rank = rank
         self.dtype = dtype
         self.num_train_timesteps = config.num_train_timesteps
         self.param_dtype = config.param_dtype
@@ -57,8 +55,7 @@ class DTT2V:
             dtype=config.t5_dtype,
             device=torch.device('cpu'),
             checkpoint_path=text_encoder_filename,
-            tokenizer_path=tokenizer_path,
-            shard_fn= None)
+            tokenizer_path=tokenizer_path)
         self.model_def = model_def
         self.image_outputs = model_def.get("image_outputs", False)
 
@@ -75,12 +72,12 @@ class DTT2V:
         # model_filename = "c:/temp/diffusion_pytorch_model-00001-of-00006.safetensors"
         base_config_file = f"configs/{base_model_type}.json"
         forcedConfigPath = base_config_file if len(model_filename) > 1 else None
-        self.model = offload.fast_load_transformers_model(model_filename, modelClass=WanModel,do_quantize= quantizeTransformer, writable_tensors= False , forcedConfigPath=forcedConfigPath)
+        def pre_load_callback(model):
+            model.lock_layers_dtypes(torch.float32 if mixed_precision_transformer else dtype)
+        self.model = offload.fast_load_transformers_model(model_filename, modelClass=WanModel,do_quantize= quantizeTransformer, writable_tensors= False, default_dtype=dtype, pre_load_callback=pre_load_callback, forcedConfigPath=forcedConfigPath)
         # offload.load_model_data(self.model, "recam.ckpt")
         # self.model.cpu()
         # dtype = torch.float16
-        self.model.lock_layers_dtypes(torch.float32 if mixed_precision_transformer else dtype)
-        offload.change_dtype(self.model, dtype, True)
         # offload.save_model(self.model, "sky_reels2_diffusion_forcing_1.3B_mbf16.safetensors", config_file_path="config.json") 
         # offload.save_model(self.model, "sky_reels2_diffusion_forcing_720p_14B_quanto_mbf16_int8.safetensors", do_quantize= True, config_file_path="c:/temp/config _df720.json") 
         # offload.save_model(self.model, "rtfp16_int8.safetensors", do_quantize= "config.json") 
@@ -223,9 +220,9 @@ class DTT2V:
         fps: int = 24,
         VAE_tile_size = 0,
         joint_pass = False,
-        slg_layers = None,
-        slg_start = 0.0,
-        slg_end = 1.0,
+        perturbation_layers = None,
+        perturbation_start = 0.0,
+        perturbation_end = 1.0,
         callback = None,
         loras_slists = None,
         **bbargs
@@ -339,7 +336,7 @@ class DTT2V:
             else:
                 self.model.cache = None
         from mmgp import offload
-        freqs = get_rotary_pos_embed(latents.shape[2 :], enable_RIFLEx= False) 
+        freqs = get_rotary_pos_embed(latents.shape[2 :], enable_RIFLEx= False, device=latents.device) 
         kwrags = {
             "freqs" :freqs,
             "fps" : fps_embeds,
@@ -351,7 +348,7 @@ class DTT2V:
         kwrags.update(i2v_extra_kwrags)
 
         for i, timestep_i in enumerate(tqdm(step_matrix)):
-            kwrags["slg_layers"] = slg_layers if int(slg_start * updated_num_steps) <= i < int(slg_end * updated_num_steps) else None
+            kwrags["perturbation_layers"] = perturbation_layers if int(perturbation_start * updated_num_steps) <= i < int(perturbation_end * updated_num_steps) else None
 
             offload.set_step_no_for_lora(self.model, i)
             update_mask_i = step_update_mask[i]

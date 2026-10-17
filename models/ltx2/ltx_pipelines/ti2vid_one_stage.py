@@ -4,16 +4,17 @@ from collections.abc import Callable, Iterator
 import torch
 
 from ..ltx_core.components.diffusion_steps import EulerDiffusionStep
-from ..ltx_core.components.guiders import CFGGuider
+from ..ltx_core.components.guiders import CFGGuider, CFGStarRescalingGuider, LtxAPGGuider
 from ..ltx_core.components.noisers import GaussianNoiser
 from ..ltx_core.components.protocols import DiffusionStepProtocol
 from ..ltx_core.components.schedulers import LTX2Scheduler
 from ..ltx_core.loader import LoraPathStrengthAndSDOps
 from ..ltx_core.model.audio_vae import decode_audio as vae_decode_audio
-from ..ltx_core.model.video_vae import decode_video as vae_decode_video
+from ..ltx_core.model.video_vae import decode_video_to_tensor as vae_decode_video_to_tensor
 from ..ltx_core.text_encoders.gemma import encode_text, postprocess_text_embeddings, resolve_text_connectors
 from ..ltx_core.tools import VideoLatentTools
 from ..ltx_core.types import LatentState, VideoPixelShape
+from shared.prompt_relay import encode_prompt_relay
 from .utils import ModelLedger
 from .utils.args import default_1_stage_arg_parser
 from .utils.constants import AUDIO_SAMPLE_RATE
@@ -29,9 +30,9 @@ from .utils.helpers import (
     image_conditionings_by_replacing_latent,
     prepare_mask_injection,
 )
-from .utils.media_io import encode_video
 from .utils.types import PipelineComponents
 from shared.utils.loras_mutipliers import update_loras_slists
+from shared.utils.self_refiner import create_self_refiner_handler, normalize_self_refiner_plan
 from shared.utils.text_encoder_cache import TextEncoderCache
 
 device = get_device()
@@ -81,14 +82,31 @@ class TI2VidOneStagePipeline:
         num_inference_steps: int,
         cfg_guidance_scale: float,
         images: list[tuple[str, int, float]],
+        prompt_relay_frame_offset: int = 0,
+        prompt_relay_epsilon: float = 1e-3,
+        audio_cfg_guidance_scale: float | None = None,
+        cfg_star_switch: int = 0,
+        apg_switch: int = 0,
+        perturbation_switch: int = 0,
+        perturbation_layers: list[int] | None = None,
+        perturbation_start: float = 0.0,
+        perturbation_end: float = 1.0,
+        alt_guidance_scale: float = 1.0,
+        alt_scale: float = 0.0,
         enhance_prompt: bool = False,
         audio_conditionings: list | None = None,
         callback: Callable[..., None] | None = None,
+        set_progress_status: Callable[[str], None] | None = None,
         interrupt_check: Callable[[], bool] | None = None,
         loras_slists: dict | None = None,
         text_connectors: dict | None = None,
         masking_source: dict | None = None,
         masking_strength: float | None = None,
+        self_refiner_setting: int = 0,
+        self_refiner_plan: str = "",
+        self_refiner_f_uncertainty: float = 0.1,
+        self_refiner_certain_percentage: float = 0.999,
+        self_refiner_max_plans: int = 1,
     ) -> tuple[Iterator[torch.Tensor], torch.Tensor]:
         assert_resolution(height=height, width=width, is_two_stage=False)
 
@@ -96,7 +114,33 @@ class TI2VidOneStagePipeline:
         mask_generator = torch.Generator(device=self.device).manual_seed(int(seed) + 1)
         noiser = GaussianNoiser(generator=generator)
         stepper = EulerDiffusionStep()
-        cfg_guider = CFGGuider(cfg_guidance_scale)
+        self_refiner_handler = None
+        self_refiner_handler_audio = None
+        if self_refiner_setting and self_refiner_setting > 0:
+            plans, _ = normalize_self_refiner_plan(self_refiner_plan or "", max_plans=self_refiner_max_plans)
+            plan_stage1 = plans[0] if plans else []
+            self_refiner_handler = create_self_refiner_handler(
+                plan_stage1,
+                self_refiner_f_uncertainty,
+                self_refiner_setting,
+                self_refiner_certain_percentage,
+                channel_dim=-1,
+            )
+            self_refiner_handler_audio = create_self_refiner_handler(
+                plan_stage1,
+                self_refiner_f_uncertainty,
+                self_refiner_setting,
+                self_refiner_certain_percentage,
+                channel_dim=-1,
+            )
+        audio_cfg_guidance_scale = cfg_guidance_scale if audio_cfg_guidance_scale is None else audio_cfg_guidance_scale
+        guider_cls = CFGGuider
+        if apg_switch:
+            guider_cls = LtxAPGGuider
+        elif cfg_star_switch:
+            guider_cls = CFGStarRescalingGuider
+        video_cfg_guider = guider_cls(cfg_guidance_scale)
+        audio_cfg_guider = guider_cls(audio_cfg_guidance_scale)
         dtype = torch.bfloat16
 
         text_encoder = self.model_ledger.text_encoder()
@@ -113,25 +157,42 @@ class TI2VidOneStagePipeline:
             video_connector,
             audio_connector,
         )
-        contexts = self.text_encoder_cache.encode(
-            encode_fn,
-            [prompt, negative_prompt],
-            device=self.device,
-            parallel=True,
+        encode_fn_with_masks = lambda prompts: postprocess_text_embeddings(
+            encode_text(text_encoder, prompts=prompts),
+            feature_extractor,
+            video_connector,
+            audio_connector,
+            return_attention_masks=True,
         )
+        relay_conditioning = encode_prompt_relay(prompt, encode_fn_with_masks, self.text_encoder_cache, self.device, num_frames, frame_rate, text_encoder.tokenizer, visible_frame_offset=prompt_relay_frame_offset, epsilon=prompt_relay_epsilon)
+        if relay_conditioning is None:
+            contexts = self.text_encoder_cache.encode(
+                encode_fn,
+                [prompt, negative_prompt],
+                device=self.device,
+                parallel=True,
+            )
+            context_p, context_n = contexts
+            v_context_p, a_context_p = context_p
+            v_context_p_mask_builder = None
+            a_context_p_mask_builder = None
+        else:
+            v_context_p = relay_conditioning.video_context
+            a_context_p = relay_conditioning.audio_context
+            context_n = self.text_encoder_cache.encode(encode_fn, [negative_prompt], device=self.device, parallel=True)[0]
+            v_context_p_mask_builder = relay_conditioning.video_mask_builder
+            a_context_p_mask_builder = relay_conditioning.audio_mask_builder
 
         torch.cuda.synchronize()
         del text_encoder
         cleanup_memory()
-        context_p, context_n = contexts
-        v_context_p, a_context_p = context_p
         v_context_n, a_context_n = context_n
 
         # Stage 1: Initial low resolution video generation.
         video_encoder = self.model_ledger.video_encoder()
         transformer = self.model_ledger.transformer()
         bind_interrupt_check(transformer, interrupt_check)
-        sigmas = LTX2Scheduler().execute(steps=num_inference_steps).to(dtype=torch.float32, device=self.device)
+        sigmas = LTX2Scheduler().execute(steps=num_inference_steps, device=self.device)
         if loras_slists is not None:
             stage_1_steps = len(sigmas) - 1
             update_loras_slists(
@@ -142,8 +203,8 @@ class TI2VidOneStagePipeline:
                 phase_switch_step2=stage_1_steps,
             )
 
-        if callback is not None:
-            callback(-1, None, True, override_num_inference_steps=len(sigmas) - 1, pass_no=1)
+        if set_progress_status is not None:
+            set_progress_status("VAE Encoding")
 
         def first_stage_denoising_loop(
             sigmas: torch.Tensor,
@@ -159,18 +220,31 @@ class TI2VidOneStagePipeline:
                 audio_state=audio_state,
                 stepper=stepper,
                 denoise_fn=guider_denoising_func(
-                    cfg_guider,
+                    video_cfg_guider,
+                    audio_cfg_guider,
                     v_context_p,
                     v_context_n,
                     a_context_p,
                     a_context_n,
                     transformer=transformer,  # noqa: F821
+                    alt_guidance_scale=alt_guidance_scale,
+                    alt_scale=alt_scale,
+                    perturbation_switch=perturbation_switch,
+                    perturbation_layers=perturbation_layers,
+                    perturbation_start=perturbation_start,
+                    perturbation_end=perturbation_end,
+                    v_context_p_mask_builder=v_context_p_mask_builder,
+                    a_context_p_mask_builder=a_context_p_mask_builder,
                 ),
                 mask_context=mask_context,
                 interrupt_check=interrupt_check,
                 callback=callback,
                 preview_tools=preview_tools,
                 pass_no=1,
+                transformer=transformer,
+                self_refiner_handler=self_refiner_handler,
+                self_refiner_handler_audio=self_refiner_handler_audio,
+                self_refiner_generator=generator,
             )
 
         stage_1_output_shape = VideoPixelShape(batch=1, frames=num_frames, width=width, height=height, fps=frame_rate)
@@ -195,6 +269,8 @@ class TI2VidOneStagePipeline:
             generator=mask_generator,
             num_steps=len(sigmas) - 1,
         )
+        if callback is not None:
+            callback(-1, None, True, override_num_inference_steps=len(sigmas) - 1, pass_no=1)
         video_state, audio_state = denoise_audio_video(
             output_shape=stage_1_output_shape,
             conditionings=stage_1_conditionings,
@@ -217,7 +293,17 @@ class TI2VidOneStagePipeline:
         del transformer
         cleanup_memory()
 
-        decoded_video = vae_decode_video(video_state.latent, self.model_ledger.video_decoder())
+        video_latent = [video_state.latent]
+        video_state = None
+        decoded_video = vae_decode_video_to_tensor(
+            video_latent,
+            self.model_ledger.video_decoder(),
+            expected_frames=int(stage_1_output_shape.frames),
+            expected_height=int(stage_1_output_shape.height),
+            expected_width=int(stage_1_output_shape.width),
+            interrupt_check=interrupt_check,
+            generator=generator,
+        )
         decoded_audio = vae_decode_audio(
             audio_state.latent, self.model_ledger.audio_decoder(), self.model_ledger.vocoder()
         )
@@ -227,6 +313,8 @@ class TI2VidOneStagePipeline:
 
 @torch.inference_mode()
 def main() -> None:
+    from .utils.media_io import encode_video
+
     logging.getLogger().setLevel(logging.INFO)
     parser = default_1_stage_arg_parser()
     args = parser.parse_args()

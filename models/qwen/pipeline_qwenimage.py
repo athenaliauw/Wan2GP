@@ -11,6 +11,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# Modifications Copyright (c) 2025-2026 DeepBeepMeep - part of WanGP, WanGP Community License 2.0 (see LICENSE.txt)
+from shared.utils.phase_progress import text_encoding_prompts, text_encoding_progress
 from mmgp import offload
 import inspect
 from typing import Any, Callable, Dict, List, Optional, Union
@@ -21,10 +23,8 @@ import math
 from diffusers.image_processor import VaeImageProcessor
 from .transformer_qwenimage import QwenImageTransformer2DModel
 
-from diffusers.utils import logging, replace_example_docstring
+from diffusers.utils import logging
 from diffusers.utils.torch_utils import randn_tensor
-from transformers import Qwen2_5_VLForConditionalGeneration, Qwen2Tokenizer, AutoTokenizer
-from .autoencoder_kl_qwenimage import AutoencoderKLQwenImage
 from diffusers import FlowMatchEulerDiscreteScheduler
 from PIL import Image
 from shared.utils.utils import calculate_new_dimensions, convert_image_to_tensor, convert_tensor_to_image
@@ -238,9 +238,11 @@ class QwenImagePipeline(): #DiffusionPipeline
                 images=image,
                 padding=True,
                 return_tensors="pt",
+                device=device,
             ).to(device)
 
-            outputs = self.text_encoder(input_ids=model_inputs.input_ids, attention_mask=model_inputs.attention_mask, pixel_values=model_inputs.pixel_values, image_grid_thw=model_inputs.image_grid_thw, output_hidden_states=True)
+            with text_encoding_progress(self.text_encoder.model.language_model.layers, prompt_count=len(prompt)):
+                outputs = self.text_encoder(input_ids=model_inputs.input_ids, attention_mask=model_inputs.attention_mask, pixel_values=model_inputs.pixel_values, image_grid_thw=model_inputs.image_grid_thw, output_hidden_states=True)
             hidden_states = outputs.hidden_states[-1]
             split_hidden_states = self._extract_masked_hidden(hidden_states, model_inputs.attention_mask)
             split_hidden_states = [e[drop_idx:] for e in split_hidden_states]
@@ -255,7 +257,8 @@ class QwenImagePipeline(): #DiffusionPipeline
                     truncation=True,
                     return_tensors="pt",
                 ).to(device)
-                hidden_states = self.text_encoder(input_ids=txt_tokens.input_ids, attention_mask=txt_tokens.attention_mask, output_hidden_states=True).hidden_states[-1]
+                with text_encoding_progress(self.text_encoder.model.language_model.layers, prompt_count=len(prompts)):
+                    hidden_states = self.text_encoder(input_ids=txt_tokens.input_ids, attention_mask=txt_tokens.attention_mask, output_hidden_states=True).hidden_states[-1]
                 split_hidden_states = self._extract_masked_hidden(hidden_states, txt_tokens.attention_mask)
                 split_hidden_states = [e[drop_idx:] for e in split_hidden_states]
                 attn_mask_list = [torch.ones(e.size(0), dtype=torch.long, device=e.device) for e in split_hidden_states]
@@ -374,9 +377,9 @@ class QwenImagePipeline(): #DiffusionPipeline
 
     @staticmethod
     def _prepare_latent_image_ids(batch_size, height, width, device, dtype):
-        latent_image_ids = torch.zeros(height, width, 3)
-        latent_image_ids[..., 1] = latent_image_ids[..., 1] + torch.arange(height)[:, None]
-        latent_image_ids[..., 2] = latent_image_ids[..., 2] + torch.arange(width)[None, :]
+        latent_image_ids = torch.zeros(height, width, 3, device=device)
+        latent_image_ids[..., 1] = latent_image_ids[..., 1] + torch.arange(height, device=device)[:, None]
+        latent_image_ids[..., 2] = latent_image_ids[..., 2] + torch.arange(width, device=device)[None, :]
 
         latent_image_id_height, latent_image_id_width, latent_image_id_channels = latent_image_ids.shape
 
@@ -422,14 +425,12 @@ class QwenImagePipeline(): #DiffusionPipeline
         else:
             image_latents = retrieve_latents(self.vae.encode(image), generator=generator, sample_mode="argmax")
         latents_mean = (
-            torch.tensor(self.vae.config.latents_mean)
+            torch.tensor(self.vae.config.latents_mean, device=image_latents.device, dtype=image_latents.dtype)
             .view(1, self.latent_channels, 1, 1, 1)
-            .to(image_latents.device, image_latents.dtype)
         )
         latents_std = (
-            torch.tensor(self.vae.config.latents_std)
+            torch.tensor(self.vae.config.latents_std, device=image_latents.device, dtype=image_latents.dtype)
             .view(1, self.latent_channels, 1, 1, 1)
-            .to(image_latents.device, image_latents.dtype)
         )
         image_latents = (image_latents - latents_mean) / latents_std
 
@@ -490,14 +491,12 @@ class QwenImagePipeline(): #DiffusionPipeline
                 images = [images]
             all_image_latents = []
             for image in images:
-                image = image.to(device=device, dtype=dtype)
                 if image.shape[1] != self.latent_channels:
-                    if self.use_Wan_VAE:
-                        image_latents = self.vae.encode(image, tile_size = tile_size)[0].unsqueeze(0)
-                    else:
-                        image_latents = self._encode_vae_image(image=image, generator=generator)
+                    image = image.to(device=device, dtype=self.vae.dtype)
+                    image_latents = self._encode_vae_image(image=image, generator=generator)
                 else:
                     image_latents = image
+                image_latents = image_latents.to(device=device, dtype=dtype)
                 if batch_size > image_latents.shape[0] and batch_size % image_latents.shape[0] == 0:
                     # expand init_latents for batch_size
                     additional_image_per_prompt = batch_size // image_latents.shape[0]
@@ -590,6 +589,9 @@ class QwenImagePipeline(): #DiffusionPipeline
         outpainting_dims = None,
         qwen_edit_plus = False,
         VAE_tile_size = 0,
+        vae_upsampler=None,
+        vae_upsampler_seed: int = 0,
+        vae_upsampler_progress_callback=None,
     ):
         r"""
         Function invoked when calling the pipeline for generation.
@@ -750,7 +752,7 @@ class QwenImagePipeline(): #DiffusionPipeline
                     if lora_inpaint:
                         image_mask_rebuilt = torch.where(convert_image_to_tensor(image_mask)>-0.5, 1., 0. )[0:1]
                         vae_tensor = convert_image_to_tensor(vae_img)
-                        green = torch.tensor([-1.0, 1.0, -1.0]).to(vae_tensor) 
+                        green = torch.tensor([-1.0, 1.0, -1.0], device=vae_tensor.device).to(vae_tensor)
                         green_image = green[:, None, None] .expand_as(vae_tensor)
                         vae_tensor = torch.where(image_mask_rebuilt > 0, green_image, vae_tensor)
                         vae_img = convert_tensor_to_image(vae_tensor)
@@ -769,25 +771,30 @@ class QwenImagePipeline(): #DiffusionPipeline
             negative_prompt_embeds is not None and negative_prompt_embeds_mask is not None
         )
         do_true_cfg = true_cfg_scale > 1 and has_neg_prompt
-        prompt_embeds, prompt_embeds_mask = self.encode_prompt(
-            image=condition_images,
-            prompt=prompt,
-            prompt_embeds=prompt_embeds,
-            prompt_embeds_mask=prompt_embeds_mask,
-            device=device,
-            num_images_per_prompt=num_images_per_prompt,
-            max_sequence_length=max_sequence_length,
-        )
-        if do_true_cfg:
-            negative_prompt_embeds, negative_prompt_embeds_mask = self.encode_prompt(
+        pending_prompts = [] if prompt_embeds is not None else [prompt] if isinstance(prompt, str) else list(prompt)
+        if do_true_cfg and negative_prompt_embeds is None:
+            pending_prompts += [negative_prompt] if isinstance(negative_prompt, str) else negative_prompt
+        prompt_count = len(pending_prompts) if condition_images else sum(p not in self.text_encoder_cache._entries for p in dict.fromkeys(pending_prompts))
+        with text_encoding_prompts(prompt_count):
+            prompt_embeds, prompt_embeds_mask = self.encode_prompt(
                 image=condition_images,
-                prompt=negative_prompt,
-                prompt_embeds=negative_prompt_embeds,
-                prompt_embeds_mask=negative_prompt_embeds_mask,
+                prompt=prompt,
+                prompt_embeds=prompt_embeds,
+                prompt_embeds_mask=prompt_embeds_mask,
                 device=device,
                 num_images_per_prompt=num_images_per_prompt,
                 max_sequence_length=max_sequence_length,
             )
+            if do_true_cfg:
+                negative_prompt_embeds, negative_prompt_embeds_mask = self.encode_prompt(
+                    image=condition_images,
+                    prompt=negative_prompt,
+                    prompt_embeds=negative_prompt_embeds,
+                    prompt_embeds_mask=negative_prompt_embeds_mask,
+                    device=device,
+                    num_images_per_prompt=num_images_per_prompt,
+                    max_sequence_length=max_sequence_length,
+                )
         additional_t_cond = None
         if getattr(self.transformer, "use_additional_t_cond", False):
             add_value = 1 if image is not None and len(condition_images) > 0 else 0
@@ -873,7 +880,7 @@ class QwenImagePipeline(): #DiffusionPipeline
                 else:
                     image_latents = image_latents[:, latents.shape[1]:] 
 
-                from shared.inpainting.lanpaint import LanPaint
+                from shared.lanpaint import LanPaint
                 lanpaint_steps = {2: 2, 3: 5, 4: 10, 5: 15}.get(model_mode_int, 5)
                 lanpaint_proc = LanPaint(NSteps=lanpaint_steps)
                 denoising_strength = 1.
@@ -909,7 +916,6 @@ class QwenImagePipeline(): #DiffusionPipeline
             if image_mask_latents is not None and denoising_strength <1. and i == first_step and morph:
                 latent_noise_factor = t/1000
                 latents  = original_image_latents  * (1.0 - latent_noise_factor) + latents * latent_noise_factor 
-
 
             latents_dtype = latents.dtype
 
@@ -990,17 +996,12 @@ class QwenImagePipeline(): #DiffusionPipeline
             latents = self.scheduler.step(noise_pred, t, latents, return_dict=False)[0]
             noise_pred = None
 
-            if image_mask_latents is not None and i < masked_steps:
-                if lanpaint_proc is None :
-                    pass
-                    # latents  =  original_image_latents * (1-image_mask_latents)  + image_mask_latents * latents
-                else:
-                    next_t = timesteps[i+1] if i<len(timesteps)-1 else 0
-                    latent_noise_factor = next_t / 1000
-                        # noisy_image  = original_image_latents  * (1.0 - latent_noise_factor) + torch.randn_like(original_image_latents) * latent_noise_factor 
-                    noisy_image  = original_image_latents  * (1.0 - latent_noise_factor) + randn * latent_noise_factor 
-                    latents  =  noisy_image * (1-image_mask_latents)  + image_mask_latents * latents
-                    noisy_image = None
+            if image_mask_latents is not None and i < masked_steps -1 :
+                next_t = timesteps[i+1] if i<len(timesteps)-1 else 0
+                latent_noise_factor = next_t / 1000
+                noisy_image  = original_image_latents  * (1.0 - latent_noise_factor) + randn * latent_noise_factor 
+                latents  =  noisy_image * (1-image_mask_latents)  + image_mask_latents * latents
+                noisy_image = None
 
             if latents.dtype != latents_dtype:
                 if torch.backends.mps.is_available():
@@ -1029,19 +1030,25 @@ class QwenImagePipeline(): #DiffusionPipeline
                 latents_to_decode = latents_to_decode.reshape(latents.shape[0] * num_layers, seq_len, dim)
             latents_to_decode = self._unpack_latents(latents_to_decode, height, width, self.vae_scale_factor)
             latents_to_decode = latents_to_decode.to(self.vae.dtype)
-            if self.use_Wan_VAE:
-                output_image = torch.cat([image.transpose(0,1) for image in self.vae.decode(latents_to_decode, tile_size= VAE_tile_size)])
-            else:
-                latents_mean = (
-                    torch.tensor(self.vae.config.latents_mean)
-                    .view(1, vae_z_dim, 1, 1, 1)
-                    .to(latents_to_decode.device, latents_to_decode.dtype)
-                )
-                latents_std = 1.0 / torch.tensor(self.vae.config.latents_std).view(1, vae_z_dim, 1, 1, 1).to(
-                    latents_to_decode.device, latents_to_decode.dtype
-                )
-                latents_to_decode = latents_to_decode / latents_std + latents_mean
-                output_image = self.vae.decode(latents_to_decode, return_dict=False)[0][:, :, 0]
+            pid_latents = latents_to_decode[:, :, 0] if vae_upsampler is not None else None
+            latents_mean = (
+                torch.tensor(self.vae.config.latents_mean, device=latents_to_decode.device)
+                .view(1, vae_z_dim, 1, 1, 1)
+                .to(latents_to_decode.device, latents_to_decode.dtype)
+            )
+            latents_std = 1.0 / torch.tensor(self.vae.config.latents_std, device=latents_to_decode.device).view(1, vae_z_dim, 1, 1, 1).to(
+                latents_to_decode.device, latents_to_decode.dtype
+            )
+            latents_to_decode = latents_to_decode / latents_std + latents_mean
+            output_image = self.vae.decode_to_cpu_uint8(latents_to_decode)[:, :, 0]
+            if vae_upsampler is not None:
+                if vae_upsampler_progress_callback is not None:
+                    vae_upsampler_progress_callback("VAE")
+                image_ref, latent_ref = [output_image], [pid_latents]
+                output_image = latents_to_decode = None
+                output_image = vae_upsampler.decode_inputs(image_ref, latent_ref, prompt=prompt, seed=vae_upsampler_seed, abort_callback=lambda: self._interrupt, progress_callback=vae_upsampler_progress_callback)
+                if output_image is None:
+                    return None
             # looks worse
             # if (
             #     num_layers == 1

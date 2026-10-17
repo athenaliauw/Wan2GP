@@ -1,9 +1,11 @@
+# Copyright (c) 2025-2026 DeepBeepMeep - part of WanGP, WanGP Community License 2.0 (see LICENSE.txt)
 import os
 import sys
 import shutil
 import tarfile
 import tempfile
 import typing
+import importlib.util
 from pathlib import Path
 
 import requests
@@ -12,6 +14,9 @@ import zipfile
 
 
 __all__ = ["download_ffmpeg"]
+
+
+_DLL_DIRECTORY_HANDLES = {}
 
 
 def download_ffmpeg(bin_directory: typing.Optional[typing.Union[str, Path]] = None):
@@ -28,6 +33,34 @@ def download_ffmpeg(bin_directory: typing.Optional[typing.Union[str, Path]] = No
 
     bin_dir.mkdir(parents=True, exist_ok=True)
     repo_root = bin_dir.parent
+
+    def _candidate_name(name: str) -> str:
+        if os.name == "nt" and not name.endswith(".exe"):
+            return f"{name}.exe"
+        return name
+
+    def _quarantine_root_ffmpeg():
+        root_ffmpeg = repo_root / _candidate_name("ffmpeg")
+        if not root_ffmpeg.is_file():
+            return
+        quarantine_dir = repo_root / "ffmpeg_quarantine"
+        quarantine_dir.mkdir(parents=True, exist_ok=True)
+        target_path = quarantine_dir / root_ffmpeg.name
+        if target_path.exists():
+            stem = target_path.stem
+            suffix = target_path.suffix
+            idx = 1
+            while True:
+                candidate = quarantine_dir / f"{stem}_{idx}{suffix}"
+                if not candidate.exists():
+                    target_path = candidate
+                    break
+                idx += 1
+        shutil.move(str(root_ffmpeg), str(target_path))
+        print(
+            f"[FFmpeg] Quarantined root binary: {root_ffmpeg} -> {target_path}. "
+            "Reason: ffmpeg.exe in the project root can be picked from CWD and break TorchCodec DLL loading on Windows. Quarantined file can be deleted if unused."
+        )
 
     def _ensure_bin_dir_on_path():
         current_path = os.environ.get("PATH", "")
@@ -48,6 +81,26 @@ def download_ffmpeg(bin_directory: typing.Optional[typing.Union[str, Path]] = No
         filtered = [p for p in path_parts if _normalize(p) not in seen]
         os.environ["PATH"] = os.pathsep.join(prioritized + filtered)
 
+    def _add_windows_dll_directory(path: Path):
+        if os.name != "nt" or not hasattr(os, "add_dll_directory") or not path.is_dir():
+            return
+        normalized = os.path.normcase(os.path.normpath(str(path)))
+        if normalized in _DLL_DIRECTORY_HANDLES:
+            return
+        _DLL_DIRECTORY_HANDLES[normalized] = os.add_dll_directory(str(path))
+
+    def _ensure_decord_dll_directory():
+        if os.name != "nt":
+            return
+        decord_spec = importlib.util.find_spec("decord")
+        if not decord_spec or not decord_spec.submodule_search_locations:
+            return
+        for location in decord_spec.submodule_search_locations:
+            decord_dir = Path(location)
+            if any(decord_dir.glob("avcodec-*.dll")):
+                _add_windows_dll_directory(decord_dir)
+                break
+
     def _ensure_library_path():
         if os.name == "nt":
             return
@@ -56,13 +109,10 @@ def download_ffmpeg(bin_directory: typing.Optional[typing.Union[str, Path]] = No
         if str(bin_dir) not in ld_parts:
             os.environ["LD_LIBRARY_PATH"] = os.pathsep.join([str(bin_dir)] + ld_parts) if current_ld else str(bin_dir)
 
+    _quarantine_root_ffmpeg()
     _ensure_bin_dir_on_path()
+    _ensure_decord_dll_directory()
     _ensure_library_path()
-
-    def _candidate_name(name: str) -> str:
-        if os.name == "nt" and not name.endswith(".exe"):
-            return f"{name}.exe"
-        return name
 
     def _resolve_path(name: str) -> typing.Optional[Path]:
         # Check ffmpeg_bins folder first

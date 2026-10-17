@@ -1,5 +1,6 @@
 # Copyright (c) 2024 NVIDIA CORPORATION.
 #   Licensed under the MIT license.
+# Modified for WanGP.
 
 # Adapted from https://github.com/jik876/hifi-gan under the MIT license.
 #   LICENSE is in incl_licenses directory.
@@ -345,6 +346,12 @@ class BigVGAN(
         except ValueError:
             print("[INFO] Model already removed weight norm. Skipping!")
             pass
+
+    @classmethod
+    def from_config(cls, config: Dict):
+        config_data = dict(config)
+        use_cuda_kernel = config_data.pop("use_cuda_kernel", False)
+        return cls(AttrDict(config_data), use_cuda_kernel=use_cuda_kernel)
 
     # Additional methods for huggingface_hub support
     def _save_pretrained(self, save_directory: Path) -> None:

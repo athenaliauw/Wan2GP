@@ -1,11 +1,11 @@
+# Adapted from Ovi (https://github.com/character-ai/Ovi), Copyright (c) the Ovi authors,
+# Apache License 2.0 (see docs/third_party_licenses/Apache-2.0.txt). Modified for WanGP.
+# Modifications Copyright (c) 2025-2026 DeepBeepMeep - part of WanGP, WanGP Community License 2.0 (see LICENSE.txt)
 
 import torch
 import torch.nn as nn
 from .model import WanLayerNorm, WanModel, WanRMSNorm, rope_apply
 from shared.attention import pay_attention
-##### Enjoy this spagheti VRAM optimizations done by DeepBeepMeep !
-# I am sure you are a nice person and as you copy this code, you will give me officially proper credits:
-# Please link to https://github.com/deepbeepmeep/Wan2GP and @deepbeepmeep on twitter  
 
 def reshape_latent(latent, latent_frames):
     return latent.reshape(latent.shape[0], latent_frames, -1, latent.shape[-1] )
@@ -294,7 +294,7 @@ class FusionModel(nn.Module):
         clip_fea_audio=None,
         y=None,
         first_frame_is_clean=False,
-        computed_slg_layers=None,
+        computed_perturbation_layers=None,
         callback = None,
         pipeline= None,
         x_id_list = 0,
@@ -333,7 +333,7 @@ class FusionModel(nn.Module):
             for x_id, one_vid, one_vid_e, one_audio, one_audio_e, one_kwargs in zip(x_id_list, vid_list, vid_e_list, audio_list, audio_e_list, kwargs_list):
                 if pipeline._interrupt:
                     return None, None
-                if x_id == 1 and computed_slg_layers is not None and i in computed_slg_layers:
+                if x_id == 1 and computed_perturbation_layers is not None and i in computed_perturbation_layers:
                     continue
                 # one_vid[...], one_audio[...] = self.single_fusion_block_forward(
                 a, b = self.single_fusion_block_forward(

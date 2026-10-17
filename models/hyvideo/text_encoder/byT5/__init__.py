@@ -13,6 +13,7 @@
 # third party's use or distribution of any of the Tencent Hunyuan works or outputs and your exercise
 # of rights and permissions under this agreement.
 # See the License for the specific language governing permissions and limitations under the License.
+# Modified for WanGP.
 
 import json
 import torch
@@ -74,7 +75,7 @@ def create_byt5(args, device):
     # xsd = torch.load( os.path.dirname( args["byT5_ckpt_path"]) + "/pytorch_model.bin")
     # Load custom checkpoint if provided
     from mmgp import offload
-    offload.load_model_data(byt5_model, args['byT5_ckpt_path'], writable_tensors= False)
+    offload.load_model_data(byt5_model, args['byT5_ckpt_path'], writable_tensors=False, default_dtype=None)
     
     if args['byT5_ckpt_path'] is not None and False:
         if "cuda" not in str(device):
@@ -176,6 +177,7 @@ def load_byt5_and_byt5_tokenizer(
     byt5_text_encoder = T5ForConditionalGeneration.from_pretrained(
         byt5_name,
         cache_dir=huggingface_cache_dir,
+        tie_word_embeddings=False,
     ).get_encoder()
 
     # byt5_text_encoder = T5EncoderModel.from_pretrained(

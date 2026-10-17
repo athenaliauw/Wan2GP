@@ -1,3 +1,4 @@
+from shared.utils.media_control import checkpoint_modules
 from typing import Literal, Optional
 import json
 import open_clip
@@ -48,7 +49,7 @@ class FeaturesUtils(nn.Module):
         need_vae_encoder: bool = True,
     ):
         super().__init__()
-        self.device ="cuda"
+        self.device = "cuda" if torch.cuda.is_available() else ("mps" if hasattr(torch.backends, "mps") and torch.backends.mps.is_available() else "cpu")
         if enable_conditions:
             old_get_model_config = open_clip.factory.get_model_config
             open_clip.factory.get_model_config = get_model_config
@@ -106,7 +107,8 @@ class FeaturesUtils(nn.Module):
         if batch_size < 0:
             batch_size = b * t
         for i in range(0, b * t, batch_size):
-            outputs.append(self.clip_model.encode_image(x[i:i + batch_size], normalize=True))
+            with checkpoint_modules(self.clip_model.visual.transformer.resblocks):
+                outputs.append(self.clip_model.encode_image(x[i:i + batch_size], normalize=True))
         x = torch.cat(outputs, dim=0)
         # x = self.clip_model.encode_image(x, normalize=True)
         x = rearrange(x, '(b t) d -> b t d', b=b)
@@ -145,7 +147,8 @@ class FeaturesUtils(nn.Module):
         assert self.tokenizer is not None, 'Tokenizer is not loaded'
         # x: (B, L)
         tokens = self.tokenizer(text).to(self.device)
-        return self.clip_model.encode_text(tokens, normalize=True)
+        with checkpoint_modules(self.clip_model.transformer.resblocks):
+            return self.clip_model.encode_text(tokens, normalize=True)
 
     @torch.inference_mode()
     def encode_audio(self, x) -> DiagonalGaussianDistribution:

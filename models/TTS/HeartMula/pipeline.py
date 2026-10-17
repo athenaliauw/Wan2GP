@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import json
 import random
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Optional
@@ -12,6 +13,7 @@ import numpy as np
 import torch
 from tokenizers import Tokenizer
 from tqdm import tqdm
+from mmgp import runtime
 from shared.utils import files_locator as fl
 
 from .heartcodec.configuration_heartcodec import HeartCodecConfig
@@ -101,8 +103,9 @@ class HeartMuLaPipeline:
         codec_guidance_scale: float = 1.25,
         codec_version: str = "",
         VAE_dtype = torch.float32,
+        lm_decoder_engine=None,
     ):
-        self.device = torch.device("cpu")
+        self.device = device or torch.device("cpu")
         self.mula_device = self.device
         self.codec_device = self.device
         self.mula_dtype = None
@@ -116,6 +119,7 @@ class HeartMuLaPipeline:
         self.codec_version = codec_version
         self.heartmula_weights_path = heartmula_weights_path
         self.VAE_dtype = VAE_dtype
+        self.lm_decoder_engine = str(lm_decoder_engine or "legacy").strip().lower()
 
         self.ckpt_root = Path(ckpt_root) if ckpt_root is not None else Path(
             fl.get_download_location()
@@ -128,6 +132,8 @@ class HeartMuLaPipeline:
         self._muq_dim = 512
 
         self._load_models()
+        engine = "cg" if self.lm_decoder_engine == "cg" else "legacy"
+        print(f"[HeartMuLa] LM Engine='{engine}', flash2={'on' if getattr(self.mula.backbone.layers[0].attn, '_flash_attn', None) is not None else 'off'}")
 
     def _load_models(self):
         (
@@ -162,8 +168,8 @@ class HeartMuLaPipeline:
         delattr(self.mula, "decoder")
         self.mula.decoder = [decoder]
 
-        if hasattr(self.mula, "_interrupt_check"):
-            self.mula._interrupt_check = self._abort_requested
+        self.mula._interrupt_check = self._abort_requested
+        self.mula.set_lm_decoder_engine(self.lm_decoder_engine)
         self.model = self.mula
         self.mula.eval()
         first_param = next(self.mula.parameters(), None)
@@ -223,15 +229,6 @@ class HeartMuLaPipeline:
         first_param = next(self.mula.parameters(), None)
         return first_param.device if first_param is not None else self.device
 
-    def _ensure_mula_loaded(self) -> None:
-        if self.mula is None:
-            return
-        mm_manager = getattr(self.mula, "_mm_manager", None)
-        mm_id = getattr(self.mula, "_mm_id", None)
-        if mm_manager is None or mm_id is None:
-            return
-        mm_manager.ensure_model_loaded(mm_id)
-
     def _move_model_inputs(
         self, model_inputs: Dict[str, Any], device: torch.device
     ) -> Dict[str, Any]:
@@ -273,7 +270,7 @@ class HeartMuLaPipeline:
         if tags_ids[-1] != self.gen_config.text_eos_id:
             tags_ids = tags_ids + [self.gen_config.text_eos_id]
 
-        muq_embed = torch.zeros([self._muq_dim], dtype=self.mula_dtype)
+        muq_embed = torch.zeros([self._muq_dim], dtype=self.mula_dtype, device="cpu")
         muq_idx = len(tags_ids)
 
         lyrics = lyrics.lower()
@@ -285,15 +282,15 @@ class HeartMuLaPipeline:
 
         prompt_len = len(tags_ids) + 1 + len(lyrics_ids)
 
-        tokens = torch.zeros([prompt_len, self._parallel_number], dtype=torch.long)
-        tokens[: len(tags_ids), -1] = torch.tensor(tags_ids)
-        tokens[len(tags_ids) + 1 :, -1] = torch.tensor(lyrics_ids)
+        tokens = torch.zeros([prompt_len, self._parallel_number], dtype=torch.long, device="cpu")
+        tokens[: len(tags_ids), -1] = torch.tensor(tags_ids, device="cpu")
+        tokens[len(tags_ids) + 1 :, -1] = torch.tensor(lyrics_ids, device="cpu")
 
         tokens_mask = torch.zeros_like(tokens, dtype=torch.bool)
         tokens_mask[:, -1] = True
 
         bs_size = 2 if cfg_scale != 1.0 else 1
-        muq_idx_tensor = torch.full((bs_size,), muq_idx, dtype=torch.long)
+        muq_idx_tensor = torch.full((bs_size,), muq_idx, dtype=torch.long, device="cpu")
 
         def _cfg_cat(tensor: torch.Tensor, cfg_scale: float):
             tensor = tensor.unsqueeze(0)
@@ -306,7 +303,7 @@ class HeartMuLaPipeline:
             "tokens_mask": _cfg_cat(tokens_mask, cfg_scale),
             "muq_embed": _cfg_cat(muq_embed, cfg_scale),
             "muq_idx": muq_idx_tensor,
-            "pos": _cfg_cat(torch.arange(prompt_len, dtype=torch.long), cfg_scale),
+            "pos": _cfg_cat(torch.arange(prompt_len, dtype=torch.long, device="cpu"), cfg_scale),
         }
 
     def _forward(
@@ -338,6 +335,13 @@ class HeartMuLaPipeline:
             self.mula.prepare_flash(mula_device, flash_dtype)
         if self._abort_requested():
             return None
+        frame_duration_ms = 80  # 80 ms per audio token frame.
+        max_audio_frames = max_audio_length_ms // frame_duration_ms
+        prompt_len = int(prompt_tokens.shape[1])
+        self.mula.prepare_decode_cuda_graph(
+            max_backbone_tokens=prompt_len + max_audio_frames,
+            max_decoder_tokens=int(getattr(self.mula.config, "audio_num_codebooks", 8)),
+        )
         try:
             curr_token = self.mula.generate_frame(
                 tokens=prompt_tokens,
@@ -371,9 +375,9 @@ class HeartMuLaPipeline:
                 padded_token_mask[..., -1] = False
                 return padded_token, padded_token_mask
 
-            frame_duration_ms = 80  # 80 ms per audio token frame.
-            max_audio_frames = max_audio_length_ms // frame_duration_ms
             progress_total_seconds = max(1, max_audio_length_ms // 1000)
+            progress_refresh_interval_s = 0.33
+            last_progress_callback_ts = 0.0
             if callback is not None:
                 callback(
                     step_idx=-1,
@@ -381,9 +385,10 @@ class HeartMuLaPipeline:
                     denoising_extra=f"0s/{progress_total_seconds}s",
                     progress_unit="seconds",
                 )
+                last_progress_callback_ts = time.monotonic()
 
             if not early_stop_now:
-                for i in tqdm(range(max_audio_frames)):
+                for i in tqdm(range(max_audio_frames), mininterval=progress_refresh_interval_s):
                     if self._abort_requested():
                         return None
                     curr_token, curr_token_mask = _pad_audio_token(curr_token)
@@ -404,7 +409,7 @@ class HeartMuLaPipeline:
                     frames.append(curr_token[0:1,])
                     if self._early_stop_requested():
                         break
-                    if i % 10 == 0 and callback is not None:
+                    if callback is not None and (time.monotonic() - last_progress_callback_ts) >= progress_refresh_interval_s:
                         generated_ms = len(frames) * frame_duration_ms
                         generated_seconds_int = min(
                             progress_total_seconds,
@@ -418,11 +423,13 @@ class HeartMuLaPipeline:
                             ),
                             progress_unit="seconds",
                         )
+                        last_progress_callback_ts = time.monotonic()
             frames = torch.stack(frames).permute(1, 2, 0).squeeze(0)
             return {"frames": frames}
         finally:
             # Drop KV cache tensors as soon as we're done with generation.
             try:
+                self.mula.release_decode_cuda_graph()
                 self.mula.move_causal_masks(torch.device("cpu"))
                 self.mula.release_caches()
                 torch.cuda.empty_cache()
@@ -516,7 +523,7 @@ class HeartMuLaPipeline:
         callback = kwargs.get("callback")
 
         model_inputs = self._build_model_inputs(lyrics, tags, cfg_scale=cfg_scale)
-        self._ensure_mula_loaded()
+        runtime.ensure_loaded(self.mula)
         target_device = self._get_mula_device()
         if target_device.type != "cuda" and torch.cuda.is_available():
             target_device = torch.device("cuda")
@@ -538,6 +545,7 @@ class HeartMuLaPipeline:
 
     def release(self) -> None:
         if hasattr(self, "mula") and self.mula is not None:
+            self.mula.release_decode_cuda_graph()
             self.mula = None
         if hasattr(self, "model"):
             self.model = None

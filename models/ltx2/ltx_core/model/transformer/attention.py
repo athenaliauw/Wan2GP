@@ -3,8 +3,11 @@ from typing import Protocol
 
 import torch
 
+from ...utils import rms_norm
+from shared import attention_kit
 from shared.attention import pay_attention
-from .rope import LTXRopeType, apply_rotary_emb_inplace
+from .rope import LTXRopeType, RopeCache, apply_rotary_emb_inplace, apply_rope_cache_heads_inplace
+from shared.kernels.ops import project_many
 
 memory_efficient_attention = None
 flash_attn_interface = None
@@ -142,34 +145,20 @@ class AttentionFunction(Enum):
 
 
 class DBMRMSNorm(torch.nn.Module):
-
     def __init__(self, dim, eps=1e-5):
         super().__init__()
         self.dim = dim
         self.eps = eps
         self.weight = torch.nn.Parameter(torch.ones(dim))
 
-    def forward(self, x, in_place= True):
+    def forward(self, x, in_place=True):
         r"""
         Args:
             x(Tensor): Shape [B, L, C]
         """
-        y = x.float()
-        y.pow_(2)
-        y = y.mean(dim=-1, keepdim=True)
-        y += self.eps
-        y.rsqrt_()
-        if in_place:
-            x *=  y
-        else:
-            x = x * y
-        x *= self.weight
-        return x
-        # return self._norm(x).type_as(x) * self.weight
+        return rms_norm(x, weight=self.weight, eps=self.eps, in_place=in_place)
 
-    def _norm(self, x):
-        return x * torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + self.eps)
-    
+
 class Attention(torch.nn.Module):
     def __init__(
         self,
@@ -180,6 +169,7 @@ class Attention(torch.nn.Module):
         norm_eps: float = 1e-6,
         rope_type: LTXRopeType = LTXRopeType.INTERLEAVED,
         attention_function: AttentionCallable | AttentionFunction = AttentionFunction.DEFAULT,
+        apply_gated_attention: bool = False,
     ) -> None:
         super().__init__()
         self.rope_type = rope_type
@@ -197,6 +187,7 @@ class Attention(torch.nn.Module):
         self.to_q = torch.nn.Linear(query_dim, inner_dim, bias=True)
         self.to_k = torch.nn.Linear(context_dim, inner_dim, bias=True)
         self.to_v = torch.nn.Linear(context_dim, inner_dim, bias=True)
+        self.to_gate_logits = torch.nn.Linear(query_dim, heads, bias=True) if apply_gated_attention else None
 
         self.to_out = torch.nn.Sequential(torch.nn.Linear(inner_dim, query_dim, bias=True), torch.nn.Identity())
 
@@ -210,6 +201,33 @@ class Attention(torch.nn.Module):
                 return "flash", 3
         return None, None
 
+    def _head_mean_squares(self, project):
+        # LTX uses vector_norm followed by square, including that rounding point. Compute each full-width statistic once;
+        # retain only per-token FP32 scalars while projecting/attending groups of heads.
+        result = []
+        for which in (0, 1):
+            full = project(which, range(self.heads)).flatten(2)
+            norm = torch.linalg.vector_norm(full, ord=2, dim=-1, keepdim=True, dtype=torch.float32)
+            del full
+            result.append(norm.square_().div_(self.heads * self.dim_head))
+        return tuple(result)
+
+    def _norm_rope_(self, query, key, pe, k_pe, group):
+        """attention_kit callback: q_norm/k_norm (over all heads) and RoPE of q and/or k in place."""
+        for which, (tensor, norm, freqs, heads) in enumerate(((query, self.q_norm, pe, group.q), (key, self.k_norm, pe if k_pe is None else k_pe, group.kv))):
+            if tensor is not None:
+                rows = tensor.flatten(2)
+                if group.mean_squares is None:
+                    norm(rows)
+                else:
+                    rows.mul_(group.mean_squares[which].add(norm.eps).rsqrt_())
+                    rows.mul_(norm.weight[heads.start * self.dim_head:heads.stop * self.dim_head])
+                if freqs is not None:
+                    if len(heads) == self.heads:
+                        apply_rotary_emb_inplace(rows, freqs, self.rope_type)
+                    else:
+                        apply_rope_cache_heads_inplace(rows, freqs, heads)
+
     def forward(
         self,
         x_list: torch.Tensor,
@@ -217,19 +235,40 @@ class Attention(torch.nn.Module):
         mask: torch.Tensor | None = None,
         pe: torch.Tensor | None = None,
         k_pe: torch.Tensor | None = None,
+        NAG: dict | None = None,
     ) -> torch.Tensor:
+        split_heads = all(freqs is None or isinstance(freqs, RopeCache) and freqs.rope_type == LTXRopeType.SPLIT
+                          and freqs.num_attention_heads == self.heads for freqs in (pe, k_pe))
+        split_cross = (context_list is not None and NAG is None and split_heads and context_list[0].shape[0] == x_list[0].shape[0] and
+                       attention_kit.head_groups(self.heads, x_list[0].shape[0] * max(x_list[0].shape[1], context_list[0].shape[1])) > 1)
+        if ((context_list is None and mask is None or split_cross) and self._resolve_attention_override()[0] is None):
+            # the gates read the attention input: computed first so that the input is released by the q/k/v projections
+            gate_logits = None if self.to_gate_logits is None else self.to_gate_logits(x_list[0])
+            callback = lambda query, key, group: self._norm_rope_(query, key, pe, k_pe, group)
+            options = dict(split_heads=split_heads, norm_spans_heads=True, norm_stats=self._head_mean_squares, attention_mask=mask)
+            if context_list is None:
+                out = attention_kit.qkv_attention(x_list, self.to_q, self.to_k, self.to_v, self.heads, self.dim_head, callback, **options)
+            else:
+                out = attention_kit.cross_qkv_attention(x_list, context_list, self.to_q, self.to_k, self.to_v, self.heads, self.dim_head, callback, **options)
+            if gate_logits is not None:
+                out.mul_((2.0 * torch.sigmoid(gate_logits).to(dtype=out.dtype)).unsqueeze(-1))
+            return self.to_out(out.flatten(2, 3))
         x = x_list[0]
+        gate_logits = None if self.to_gate_logits is None else self.to_gate_logits(x)  # first: x is released after the projections
         x_list.clear()
         context = None
         if context_list is not None:
             context = context_list[0]
             context_list.clear()
         cross_attn = context is not None
-        q = self.to_q(x)
-        context = x if context is None else context
+        if cross_attn:
+            q = self.to_q(x)
+            context_list, context, x = [context], None, None
+            k, v = project_many((self.to_k, self.to_v), context_list)
+        else:
+            x_list, x = [x], None
+            q, k, v = project_many((self.to_q, self.to_k, self.to_v), x_list)
         x = None
-        k = self.to_k(context)
-        v = self.to_v(context)
         context = None
         self.q_norm(q)
         self.k_norm(k)
@@ -241,8 +280,54 @@ class Attention(torch.nn.Module):
         q = q.view(q.shape[0], -1, self.heads, self.dim_head)
         k = k.view(k.shape[0], -1, self.heads, self.dim_head)
         v = v.view(v.shape[0], -1, self.heads, self.dim_head)
-
         force_attention, attention_version = self._resolve_attention_override()
+
+        if cross_attn and NAG is not None:
+            cap_len = int(NAG.get("cap_embed_len", 0) or 0)
+            if cap_len > 0 and k.shape[1] == cap_len * 2:
+                pos_mask = None if mask is None else mask[..., :cap_len]
+                neg_mask = None if mask is None else mask[..., cap_len : cap_len * 2]
+                qkv_list = [q, k[:, :cap_len], v[:, :cap_len]]
+                # Keep the merge in attention-output space with in-place ops, following the Wan low-allocation path.
+                x_pos = pay_attention(
+                    qkv_list,
+                    attention_mask=pos_mask,
+                    force_attention=force_attention,
+                    version=attention_version,
+                )
+                qkv_list = [q, k[:, cap_len : cap_len * 2], v[:, cap_len : cap_len * 2]]
+                q = k = v = None
+                out = pay_attention(
+                    qkv_list,
+                    attention_mask=neg_mask,
+                    force_attention=force_attention,
+                    version=attention_version,
+                    recycle_q=True,
+                )
+                nag_scale = float(NAG["scale"])
+                nag_alpha = float(NAG["alpha"])
+                nag_tau = float(NAG["tau"])
+                out.mul_(1 - nag_scale)
+                out.add_(x_pos, alpha=nag_scale)
+                norm_positive = torch.sum(torch.abs(x_pos), dim=(2, 3), keepdim=True)
+                norm_guidance = torch.sum(torch.abs(out), dim=(2, 3), keepdim=True)
+                scale = norm_guidance / norm_positive
+                torch.nan_to_num(scale, nan=10.0, posinf=10.0, neginf=10.0, out=scale)
+                factor = (norm_positive * nag_tau) / (norm_guidance + 1e-7)
+                out = torch.where(scale > nag_tau, out * factor, out)
+                del norm_positive, norm_guidance, scale, factor
+                x_pos.mul_(1 - nag_alpha)
+                out.mul_(nag_alpha)
+                out.add_(x_pos)
+                x_pos = None
+                if gate_logits is not None:
+                    gates = 2.0 * torch.sigmoid(gate_logits).to(dtype=out.dtype)
+                    out.mul_(gates.unsqueeze(-1))
+                gate_logits = None
+                out = out.flatten(2, 3)
+                out = self.to_out(out)
+                return out
+
         qkv_list = [q, k, v]
         q = k = v = None
         out = pay_attention(
@@ -250,8 +335,12 @@ class Attention(torch.nn.Module):
             attention_mask=mask,
             force_attention=force_attention,
             version=attention_version,
-            cross_attn=cross_attn
+            recycle_q= True,
         )
+        if gate_logits is not None:
+            gates = 2.0 * torch.sigmoid(gate_logits).to(dtype=out.dtype)
+            out.mul_(gates.unsqueeze(-1))
+        gate_logits = None
         out = out.flatten(2, 3)
         out = self.to_out(out)
         return out

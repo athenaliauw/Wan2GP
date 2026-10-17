@@ -19,6 +19,8 @@ class _BasicTransformerBlock1D(torch.nn.Module):
         heads: int,
         dim_head: int,
         rope_type: LTXRopeType = LTXRopeType.INTERLEAVED,
+        apply_gated_attention: bool = False,
+        ff_bias: bool = True,
     ):
         super().__init__()
 
@@ -27,11 +29,13 @@ class _BasicTransformerBlock1D(torch.nn.Module):
             heads=heads,
             dim_head=dim_head,
             rope_type=rope_type,
+            apply_gated_attention=apply_gated_attention,
         )
 
         self.ff = FeedForward(
             dim,
             dim_out=dim,
+            bias=ff_bias,
         )
 
     def forward(
@@ -101,6 +105,8 @@ class Embeddings1DConnector(torch.nn.Module):
         num_learnable_registers: int | None = 128,
         rope_type: LTXRopeType = LTXRopeType.INTERLEAVED,
         double_precision_rope: bool = False,
+        apply_gated_attention: bool = False,
+        ff_bias: bool = True,
     ):
         super().__init__()
         self.num_attention_heads = num_attention_heads
@@ -119,6 +125,8 @@ class Embeddings1DConnector(torch.nn.Module):
                     heads=num_attention_heads,
                     dim_head=attention_head_dim,
                     rope_type=rope_type,
+                    apply_gated_attention=apply_gated_attention,
+                    ff_bias=ff_bias,
                 )
                 for _ in range(num_layers)
             ]
@@ -171,8 +179,10 @@ class Embeddings1DConnector(torch.nn.Module):
         Returns:
             tuple[torch.Tensor, torch.Tensor]: Processed features and the corresponding (possibly modified) mask.
         """
+        block_attention_mask = attention_mask
         if self.num_learnable_registers:
             hidden_states, attention_mask = self._replace_padded_with_learnable_registers(hidden_states, attention_mask)
+            block_attention_mask = None
 
         indices_grid = torch.arange(hidden_states.shape[1], dtype=torch.float32, device=hidden_states.device)
         indices_grid = indices_grid[None, None, :]
@@ -189,7 +199,7 @@ class Embeddings1DConnector(torch.nn.Module):
         )
 
         for block in self.transformer_1d_blocks:
-            hidden_states = block(hidden_states, attention_mask=attention_mask, pe=freqs_cis)
+            hidden_states = block(hidden_states, attention_mask=block_attention_mask, pe=freqs_cis)
 
         hidden_states = rms_norm(hidden_states)
 
@@ -197,16 +207,61 @@ class Embeddings1DConnector(torch.nn.Module):
 
 
 class Embeddings1DConnectorConfigurator(ModelConfigurator[Embeddings1DConnector]):
+    """Configurator for video embeddings connector."""
+
     @classmethod
     def from_config(cls: type[Embeddings1DConnector], config: dict) -> Embeddings1DConnector:
-        config = config.get("transformer", {})
-        rope_type = LTXRopeType(config.get("rope_type", "interleaved"))
-        double_precision_rope = config.get("frequencies_precision", False) == "float64"
-        pe_max_pos = config.get("connector_positional_embedding_max_pos", [1])
+        transformer_config = config.get("transformer", {})
+        rope_type = LTXRopeType(transformer_config.get("rope_type", "interleaved"))
+        double_precision_rope = transformer_config.get("frequencies_precision", False) == "float64"
+        pe_max_pos = transformer_config.get("connector_positional_embedding_max_pos", [1])
+        num_attention_heads = transformer_config.get("connector_num_attention_heads", 30)
+        attention_head_dim = transformer_config.get("connector_attention_head_dim", 128)
+        num_layers = transformer_config.get("connector_num_layers", 2)
 
         connector = Embeddings1DConnector(
+            num_attention_heads=num_attention_heads,
+            attention_head_dim=attention_head_dim,
+            num_layers=num_layers,
             positional_embedding_max_pos=pe_max_pos,
             rope_type=rope_type,
             double_precision_rope=double_precision_rope,
+            apply_gated_attention=transformer_config.get("connector_apply_gated_attention", False),
+            ff_bias=transformer_config.get("connector_ff_bias", True),
+        )
+        return connector
+
+
+class AudioEmbeddings1DConnectorConfigurator(ModelConfigurator[Embeddings1DConnector]):
+    """Configurator for audio embeddings connector with separate dimensions."""
+
+    @classmethod
+    def from_config(cls: type[Embeddings1DConnector], config: dict) -> Embeddings1DConnector:
+        transformer_config = config.get("transformer", {})
+        rope_type = LTXRopeType(transformer_config.get("rope_type", "interleaved"))
+        double_precision_rope = transformer_config.get("frequencies_precision", False) == "float64"
+        pe_max_pos = transformer_config.get("connector_positional_embedding_max_pos", [1])
+        num_attention_heads = transformer_config.get(
+            "audio_connector_num_attention_heads",
+            transformer_config.get("connector_num_attention_heads", 30),
+        )
+        attention_head_dim = transformer_config.get(
+            "audio_connector_attention_head_dim",
+            transformer_config.get("connector_attention_head_dim", 128),
+        )
+        num_layers = transformer_config.get(
+            "audio_connector_num_layers",
+            transformer_config.get("connector_num_layers", 2),
+        )
+
+        connector = Embeddings1DConnector(
+            num_attention_heads=num_attention_heads,
+            attention_head_dim=attention_head_dim,
+            num_layers=num_layers,
+            positional_embedding_max_pos=pe_max_pos,
+            rope_type=rope_type,
+            double_precision_rope=double_precision_rope,
+            apply_gated_attention=transformer_config.get("connector_apply_gated_attention", False),
+            ff_bias=transformer_config.get("connector_ff_bias", True),
         )
         return connector

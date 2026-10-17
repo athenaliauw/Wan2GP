@@ -1,5 +1,6 @@
 # Copyright 2024-2025 The Alibaba Wan Team Authors. All rights reserved.
 # SCAIL model integration for WanGP
+# Modified for WanGP.
 
 import torch
 from typing import Optional
@@ -32,7 +33,7 @@ def build_scail_pose_tokens(model, pose_latents: torch.Tensor, target_dtype: Opt
         dtype=pose_latents.dtype,
     )
     pose_input = torch.cat([pose_latents, pose_mask], dim=1)
-    pose_embed = model.pose_patch_embedding(pose_input)  # (B, dim, T', H', W')
+    pose_embed = model.pose_patch_embedding(pose_input.to(model.pose_patch_embedding.weight.dtype))  # (B, dim, T', H', W')
     return pose_embed.flatten(2).transpose(1, 2)
 
 

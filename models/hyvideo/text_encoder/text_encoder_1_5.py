@@ -13,7 +13,9 @@
 # third party's use or distribution of any of the Tencent Hunyuan works or outputs and your exercise
 # of rights and permissions under this agreement.
 # See the License for the specific language governing permissions and limitations under the License.
+# Modified for WanGP.
 
+from shared.utils.phase_progress import text_encoding_progress
 import json
 import os
 from copy import deepcopy
@@ -97,13 +99,12 @@ def load_text_encoder(
 
     from mmgp import offload
     # text_encoder = offload.fast_load_transformers_model(text_encoder_path, forcedConfigPath=  os.path.join(os.path.dirname(text_encoder_path), "config.json"))
-    text_encoder = offload.fast_load_transformers_model(text_encoder_path,  writable_tensors= True , modelClass=Qwen2_5_VLForConditionalGeneration,  defaultConfigPath= fl.locate_file(os.path.join("Qwen2.5-VL-7B-Instruct", "config.json")) )
+    text_encoder = offload.fast_load_transformers_model(text_encoder_path,  writable_tensors= False , modelClass=Qwen2_5_VLForConditionalGeneration,  defaultConfigPath= fl.locate_file(os.path.join("Qwen2.5-VL-7B-Instruct", "config.json")) )
 
     # text_encoder = AutoModel.from_pretrained(text_encoder_path, low_cpu_mem_usage=True)
     
-    if hasattr(text_encoder, 'language_model'):
-        text_encoder = text_encoder.language_model
-    text_encoder.final_layer_norm = text_encoder.norm
+    lm = getattr(text_encoder, "language_model", None) or getattr(getattr(text_encoder, "model", None), "language_model", None)
+    text_encoder.final_layer_norm = lm.norm if lm is not None else text_encoder.norm
     
     # from_pretrained will ensure that the model is in eval mode.
     # if text_encoder_precision is not None:
@@ -478,12 +479,13 @@ class TextEncoder(nn.Module):
         attention_mask = (
             batch_encoding["attention_mask"].to(device) if use_attention_mask else None
         )
-        outputs = self.model(
-            input_ids=batch_encoding["input_ids"].to(device),
-            attention_mask=attention_mask,
-            output_hidden_states=output_hidden_states
-            or hidden_state_skip_layer is not None,
-        )
+        with text_encoding_progress(self.model.model.language_model.layers, prompt_count=batch_encoding["input_ids"].shape[0]):
+            outputs = self.model(
+                input_ids=batch_encoding["input_ids"].to(device),
+                attention_mask=attention_mask,
+                output_hidden_states=output_hidden_states
+                or hidden_state_skip_layer is not None,
+            )
         if hidden_state_skip_layer is not None:
             last_hidden_state = outputs.hidden_states[-(hidden_state_skip_layer + 1)]
             # Real last hidden state already has layer norm applied. So here we only apply it

@@ -1,11 +1,15 @@
 # Modified from transformers.models.t5.modeling_t5
 # Copyright 2024-2025 The Alibaba Wan Team Authors. All rights reserved.
+# Modifications Copyright (c) 2025-2026 DeepBeepMeep - part of WanGP, WanGP Community License 2.0 (see LICENSE.txt)
 import logging
 import math
+from functools import lru_cache
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+from shared.utils.gguf_mapping import has_standard_gguf_tensor_names, remap_state_dict_triplet
 
 from .tokenizers import HuggingfaceTokenizer
 
@@ -621,6 +625,48 @@ def convert_umt5_encoder_to_wan_format(
     return dst
 
 
+@lru_cache(maxsize=1)
+def _umt5_gguf_name_map():
+    from accelerate import init_empty_weights
+    from transformers import UMT5Config, UMT5EncoderModel
+    from transformers.modeling_gguf_pytorch_utils import get_gguf_hf_weights_map
+
+    config = UMT5Config(
+        vocab_size=256384,
+        d_model=4096,
+        d_kv=64,
+        d_ff=10240,
+        num_layers=24,
+        num_decoder_layers=24,
+        num_heads=64,
+        relative_attention_num_buckets=32,
+        feed_forward_proj="gated-gelu",
+    )
+    with init_empty_weights():
+        model = UMT5EncoderModel(config)
+    return get_gguf_hf_weights_map(model, model_type="t5encoder", num_layers=24)
+
+
+def _preprocess_umt5_state_dict(state_dict, quantization_map=None, tied_weights_map=None):
+    if has_standard_gguf_tensor_names(state_dict):
+        state_dict, quantization_map, tied_weights_map = remap_state_dict_triplet(
+            state_dict,
+            quantization_map,
+            tied_weights_map,
+            _umt5_gguf_name_map(),
+            keep_unmapped=False,
+        )
+
+    is_hf_encoder = "shared.weight" in state_dict or any(name.startswith("encoder.") for name in state_dict)
+    if not is_hf_encoder:
+        return state_dict, quantization_map, tied_weights_map
+
+    state_dict = convert_umt5_encoder_to_wan_format(state_dict)
+    if quantization_map is not None:
+        quantization_map = convert_umt5_encoder_to_wan_format(quantization_map)
+    return state_dict, quantization_map, tied_weights_map
+
+
 class T5EncoderModel:
 
     def __init__(
@@ -630,7 +676,6 @@ class T5EncoderModel:
         device=torch.cuda.current_device(),
         checkpoint_path=None,
         tokenizer_path=None,
-        shard_fn=None,
     ):
         self.text_len = text_len
         self.dtype = dtype
@@ -648,20 +693,16 @@ class T5EncoderModel:
                 device=device).eval().requires_grad_(False)
         logging.info(f'loading {checkpoint_path}')
         from mmgp import offload
-        def preprocess_sd(sd):
-            first = next(iter(sd))
-            if first.startswith("encoder."):
-                new_sd = convert_umt5_encoder_to_wan_format(sd)
-                return new_sd
-            else:
-                return sd            
-        offload.load_model_data(model,checkpoint_path, writable_tensors= False,  preprocess_sd= preprocess_sd )
+        offload.load_model_data(
+            model,
+            checkpoint_path,
+            writable_tensors=False,
+            default_dtype=torch.bfloat16,
+            preprocess_sd=_preprocess_umt5_state_dict,
+        )
 
         self.model = model
-        if shard_fn is not None:
-            self.model = shard_fn(self.model, sync_module_states=False)
-        else:
-            self.model.to(self.device)
+        self.model.to(self.device)
         # init tokenizer
         self.tokenizer = HuggingfaceTokenizer(
             name=tokenizer_path, seq_len=text_len, clean='whitespace')
@@ -672,5 +713,7 @@ class T5EncoderModel:
         ids = ids.to(device)
         mask = mask.to(device)
         seq_lens = mask.gt(0).sum(dim=1).long()
-        context = self.model(ids, mask)
+        from shared.utils.phase_progress import text_encoding_progress
+        with text_encoding_progress(self.model.blocks, prompt_count=len(texts)):
+            context = self.model(ids, mask)
         return [u[:v] for u, v in zip(context, seq_lens)]

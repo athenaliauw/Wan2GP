@@ -1,3 +1,4 @@
+from shared.utils.phase_progress import text_encoding_progress
 import os
 import torch
 from transformers import (
@@ -16,8 +17,10 @@ from shared.utils.text_encoder_cache import TextEncoderCache
 
 class ClipTextEmbedder:
     def __init__(self, conf, device):
-        self.model = CLIPTextModel.from_pretrained(conf.checkpoint_path).to(device)
-        self.model = freeze(self.model)
+        self.model= offload.fast_load_transformers_model(os.path.join(conf.checkpoint_path, "model.safetensors"), modelClass=CLIPTextModel, ignore_unused_weights= True, forcedConfigPath=os.path.join(conf.checkpoint_path, "text_config.json"), writable_tensors=False)
+        self.model.final_layer_norm = self.model.text_model.final_layer_norm
+        self.model.eval()
+        # self.model = freeze(self.model)
         self.tokenizer = CLIPTokenizer.from_pretrained(conf.checkpoint_path)
         self.max_length = conf.max_length
 
@@ -91,7 +94,7 @@ class Qwen2_5_VLTextEmbedder:
             config_path = os.path.join(os.path.dirname(checkpoint_path), "config.json")
             self.model = offload.fast_load_transformers_model(
                 checkpoint_path,
-                writable_tensors=True,
+                writable_tensors=False,
                 modelClass=Qwen2_5_VLForConditionalGeneration,
                 defaultConfigPath=config_path,
                 default_dtype=torch.bfloat16,
@@ -231,15 +234,17 @@ class Kandinsky5TextEmbedder:
         if isinstance(texts, str):
             texts = [texts]
         if images is not None:
-            text_embeds, cu_seqlens, attention_mask = self.embedder(texts, images=images, type_of_content=type_of_content)
-            pooled_embed = self.clip_embedder(texts)
+            with text_encoding_progress(list(self.embedder.model.model.language_model.layers) + list(self.clip_embedder.model.text_model.encoder.layers), prompt_count=len(texts)):
+                text_embeds, cu_seqlens, attention_mask = self.embedder(texts, images=images, type_of_content=type_of_content)
+                pooled_embed = self.clip_embedder(texts)
             if attention_mask is not None:
                 attention_mask = attention_mask.to(torch.bool)
             return {"text_embeds": text_embeds, "pooled_embed": pooled_embed}, cu_seqlens, attention_mask
 
         def encode_fn(prompts):
-            text_embeds, cu_seqlens, attention_mask = self.embedder(prompts, images=None, type_of_content=type_of_content)
-            pooled_embed = self.clip_embedder(prompts)
+            with text_encoding_progress(list(self.embedder.model.model.language_model.layers) + list(self.clip_embedder.model.text_model.encoder.layers), prompt_count=len(prompts)):
+                text_embeds, cu_seqlens, attention_mask = self.embedder(prompts, images=None, type_of_content=type_of_content)
+                pooled_embed = self.clip_embedder(prompts)
             if attention_mask is not None:
                 attention_mask = attention_mask.to(torch.bool)
                 return [

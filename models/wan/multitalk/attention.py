@@ -1,8 +1,9 @@
 # Copyright 2024-2025 The Alibaba Wan Team Authors. All rights reserved.
+# Modified for WanGP.
 import torch
 import torch.nn as nn
 from einops import rearrange, repeat
-from .multitalk_utils import RotaryPositionalEmbedding1D, normalize_and_scale, split_token_counts_and_frame_ids
+from .multitalk_utils import RotaryPositionalEmbedding1D, normalize_and_scale
 from shared.attention import pay_attention
 
 # import xformers.ops

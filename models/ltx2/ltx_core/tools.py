@@ -49,7 +49,8 @@ class LatentTools(Protocol):
         latent = self.patchifier.patchify(latent_state.latent)
         clean_latent = self.patchifier.patchify(latent_state.clean_latent)
         denoise_mask = self.patchifier.patchify(latent_state.denoise_mask)
-        return replace(latent_state, latent=latent, denoise_mask=denoise_mask, clean_latent=clean_latent)
+        keyframes_mask = self.patchifier.patchify(latent_state.keyframes_mask) if latent_state.keyframes_mask is not None else None
+        return replace(latent_state, latent=latent, denoise_mask=denoise_mask, clean_latent=clean_latent, keyframes_mask=keyframes_mask)
 
     def unpatchify(self, latent_state: LatentState) -> LatentState:
         """
@@ -61,13 +62,21 @@ class LatentTools(Protocol):
         denoise_mask = self.patchifier.unpatchify(
             latent_state.denoise_mask, output_shape=self.target_shape.mask_shape()
         )
-        return replace(latent_state, latent=latent, denoise_mask=denoise_mask, clean_latent=clean_latent)
+        keyframes_mask = self.patchifier.unpatchify(latent_state.keyframes_mask, output_shape=self.target_shape.mask_shape()) if latent_state.keyframes_mask is not None else None
+        return replace(latent_state, latent=latent, denoise_mask=denoise_mask, clean_latent=clean_latent, keyframes_mask=keyframes_mask)
 
     def clear_conditioning(self, latent_state: LatentState) -> LatentState:
         """
         Clear the conditioning from the latent state. This method removes extra tokens from the end of the latent.
         Therefore, conditioning items should add extra tokens ONLY to the end of the latent.
+        Generated keyframe slots are output rather than conditioning: their denoised content is kept in ``generated_keyframes``.
         """
+        layout = latent_state.generated_keyframe_layout
+        generated_keyframes = None
+        if layout is not None:
+            frame_shape = self.target_shape._replace(frames=1)
+            tokens = latent_state.latent[:, layout.token_slice].split(layout.tokens_per_keyframe, dim=1)
+            generated_keyframes = torch.cat([self.patchifier.unpatchify(frame_tokens, output_shape=frame_shape) for frame_tokens in tokens], dim=2)
         latent_state = latent_state.clone()
 
         num_tokens = self.patchifier.get_token_count(self.target_shape)
@@ -76,7 +85,12 @@ class LatentTools(Protocol):
         denoise_mask = torch.ones_like(latent_state.denoise_mask)[:, :num_tokens]
         positions = latent_state.positions[:, :, :num_tokens]
 
-        return LatentState(latent=latent, denoise_mask=denoise_mask, positions=positions, clean_latent=clean_latent)
+        attention_mask = None
+        if latent_state.attention_mask is not None:
+            attention_mask = latent_state.attention_mask[:, :num_tokens, :num_tokens]
+        keyframes_mask = latent_state.keyframes_mask[:, :num_tokens] if latent_state.keyframes_mask is not None else None
+
+        return LatentState(latent=latent, denoise_mask=denoise_mask, positions=positions, clean_latent=clean_latent, attention_mask=attention_mask, keyframes_mask=keyframes_mask, generated_keyframe_layout=layout, generated_keyframes=generated_keyframes)
 
 
 @dataclass(frozen=True)
@@ -130,14 +144,18 @@ class VideoLatentTools(LatentTools):
         ).float()
         positions[:, 0, ...] = positions[:, 0, ...] / self.fps
 
-        return self.patchify(
+        state = self.patchify(
             LatentState(
                 latent=initial_latent,
                 denoise_mask=denoise_mask,
-                positions=positions.to(dtype),
+                positions=positions,
                 clean_latent=clean_latent,
             )
         )
+        keyframes_mask = torch.zeros_like(state.denoise_mask)
+        first_frame_tokens = self.patchifier.get_token_count(self.target_shape._replace(frames=1))
+        keyframes_mask[:, :first_frame_tokens] = 1.0
+        return replace(state, keyframes_mask=keyframes_mask)
 
 
 @dataclass(frozen=True)
@@ -186,3 +204,30 @@ class AudioLatentTools(LatentTools):
                 latent=initial_latent, denoise_mask=denoise_mask, positions=latent_coords, clean_latent=clean_latent
             )
         )
+
+    def clear_conditioning(self, latent_state: LatentState) -> LatentState:
+        latent_state = latent_state.clone()
+
+        num_tokens = self.patchifier.get_token_count(self.target_shape)
+        start_token = 0
+        positions = latent_state.positions
+        if positions is not None and positions.ndim >= 4 and positions.shape[1] >= 1:
+            ref_mask = positions[:, 0, :, 1] < 0
+            if ref_mask.ndim == 2 and torch.any(ref_mask):
+                counts = ref_mask.sum(dim=1)
+                if torch.all(counts == counts[:1]):
+                    ref_tokens = int(counts[0].item())
+                    total_tokens = int(ref_mask.shape[1])
+                    if 0 < ref_tokens < total_tokens and torch.all(ref_mask[:, :ref_tokens]) and not torch.any(ref_mask[:, ref_tokens:]):
+                        start_token = ref_tokens
+
+        stop_token = start_token + num_tokens
+        latent = latent_state.latent[:, start_token:stop_token]
+        clean_latent = latent_state.clean_latent[:, start_token:stop_token]
+        denoise_mask = torch.ones_like(latent_state.denoise_mask[:, start_token:stop_token])
+        positions = latent_state.positions[:, :, start_token:stop_token]
+        attention_mask = None
+        if latent_state.attention_mask is not None:
+            attention_mask = latent_state.attention_mask[:, start_token:stop_token, start_token:stop_token]
+
+        return LatentState(latent=latent, denoise_mask=denoise_mask, positions=positions, clean_latent=clean_latent, attention_mask=attention_mask)

@@ -1,12 +1,43 @@
 # Copyright 2024-2025 The Alibaba Wan Team Authors. All rights reserved.
+# Modifications Copyright (c) 2025-2026 DeepBeepMeep - part of WanGP, WanGP Community License 2.0 (see LICENSE.txt)
+import sys
+from contextlib import contextmanager
+
 import torch
 from importlib.metadata import version
-from mmgp import offload
+from mmgp import cuda_graphs, offload
 import torch.nn.functional as F
 import warnings
+from importlib.metadata import version
 
-major, minor = torch.cuda.get_device_capability(None)
-bfloat16_supported =  major >= 8 
+_is_mps = sys.platform == 'darwin' and hasattr(torch.backends, 'mps') and torch.backends.mps.is_available()
+
+major, minor = (0, 0) if _is_mps else torch.cuda.get_device_capability(None)
+bfloat16_supported =  major >= 8
+_MASKED_ATTENTION_SDPA_WARNED = False
+_MISSING = object()
+
+try:
+    import triton
+    triton_installed = True
+except:
+    triton_installed = False
+
+
+# Model-specific attention modes exposed only by per-generation overrides.
+# Keep these out of get_attention_modes() so they never appear in the main
+# application attention configuration.
+ATTENTION_MODE_AVAILABILITY = {
+    "sol": {
+        "installed": triton_installed,
+        "supported": triton_installed and (major, minor) in ((8, 6), (8, 9), (9, 0), (10, 0), (12, 0), (12, 1)),
+    },
+    "veda": {
+        "installed": triton_installed,
+        "supported": triton_installed and major >= 8 and not torch.version.hip,
+    },
+}
+
 
 try:
     from xformers.ops import memory_efficient_attention
@@ -28,6 +59,7 @@ except ModuleNotFoundError:
 
 try:
     from sageattention import sageattn_varlen
+    from . import sage1_core
     def sageattn_varlen_wrapper(
             q,
             k,
@@ -36,47 +68,118 @@ try:
             cu_seqlens_kv,
             max_seqlen_q,
             max_seqlen_kv,
+            is_causal=False,
+            sm_scale=None,
         ):
-        return sageattn_varlen(q, k, v, cu_seqlens_q, cu_seqlens_kv, max_seqlen_q, max_seqlen_kv)
+        return sageattn_varlen(
+            q,
+            k,
+            v,
+            cu_seqlens_q,
+            cu_seqlens_kv,
+            max_seqlen_q,
+            max_seqlen_kv,
+            is_causal=is_causal,
+            sm_scale=sm_scale,
+        )
     
 except ImportError:
-    sageattn_varlen_wrapper = None
+    sageattn_varlen_wrapper = sage1_core = None
 
 try:
     from spas_sage_attn import block_sparse_sage2_attn_cuda
 except ImportError:
     block_sparse_sage2_attn_cuda = None
-
+    if not triton_installed: 
+        try:
+            sg2_version = version("sageattention")
+            print("Sage Attention has been detected but it won't work until Triton is installed.")
+        except ImportError:
+            pass
 
 try:
-    from .sage2_core import sageattn as sageattn2, is_sage2_supported
+    from .sage2_core import sageattn as sageattn2, is_sage2_supported, sageattn_attention_mask_support_reason
+    from . import sage2_core
     sage2_supported =  is_sage2_supported()
 except ImportError:
-    sageattn2 = None
+    sageattn2 = sage2_core = None
     sage2_supported = False
+    sageattn_attention_mask_support_reason = lambda *args, **kwargs: "SageAttention 2 is unavailable"
+    if not triton_installed: 
+        try:
+            sg2_version = version("sageattention")
+            if not triton_installed: print("Sage Attention 2 has been detected but it won't work until Triton is installed.")
+        except ImportError:
+            pass
+
+def sage_attention_mask(attention_mask, q_dtype, causal_mask=None):
+    """pay_attention's mask ((batch, q, heads, k), 3D or 2D) as SageAttention takes it: (batch, heads, q, k), in q's dtype when it is
+    additive; a boolean mask lets the queries that see no key attend to all keys."""
+    if attention_mask.ndim == 4:
+        attention_mask = attention_mask.transpose(1, 2)
+    elif attention_mask.ndim == 3:
+        attention_mask = attention_mask.unsqueeze(1)
+    elif attention_mask.ndim == 2:
+        attention_mask = attention_mask.unsqueeze(0).unsqueeze(0)
+    if torch.is_floating_point(attention_mask):
+        attention_mask = attention_mask.to(dtype=q_dtype)
+        if causal_mask is not None:
+            attention_mask = attention_mask.masked_fill(~causal_mask, torch.finfo(attention_mask.dtype).min)
+    elif attention_mask.dtype == torch.bool:
+        if causal_mask is not None:
+            attention_mask = attention_mask & causal_mask
+        has_keys = attention_mask.any(dim=-1, keepdim=True)
+        attention_mask = torch.where(has_keys, attention_mask, torch.ones_like(attention_mask))
+    return attention_mask
+
+
 @torch.compiler.disable()
 def sageattn2_wrapper(
         qkv_list,
-        attention_length
+        attention_length,
+        recycle_q = False,
+        attention_mask = None,
+        causal = False,
     ):
-    q,k, v = qkv_list
-    qkv_list = [q,k,v]
-    del q, k ,v
-    o = sageattn2(qkv_list, tensor_layout="NHD")
+    # no reference is kept here: the kernel takes q, k and v out of the list and frees k and v once quantized
+    if attention_mask is not None:
+        causal_mask = None
+        if causal:
+            lq, lk, device = qkv_list[0].shape[1], qkv_list[1].shape[1], qkv_list[0].device
+            row = torch.arange(lq, device=device)[:, None]
+            col = torch.arange(lk, device=device)[None, :]
+            causal_mask = (col <= row).view(1, 1, lq, lk)
+            causal = False
+        attention_mask = sage_attention_mask(attention_mask, qkv_list[0].dtype, causal_mask)
+    o = sageattn2(qkv_list, tensor_layout="NHD", is_causal=causal, recycle_q=recycle_q, attn_mask=attention_mask)
     qkv_list.clear()
 
     return o
 
 try:
     from sageattn import sageattn_blackwell as sageattn3
+    if not triton_installed:
+        print("Sage Attention 3 is installed but it won't be supported until Triton is installed.")
 except ImportError:
     sageattn3 = None
+    if not triton_installed: 
+        try:
+            sg3_version = version("sageattn_blackwell")
+            print("Sage Attention 3 has been detected but it won't work until Triton is installed.")
+        except ImportError:
+            pass
 
 if sageattn3 is None:
     try:
         from sageattn3 import sageattn3_blackwell as sageattn3 #word0 windows version
     except ImportError:
         sageattn3 = None
+        if not triton_installed: 
+            try:
+                sg3_version = version("sageattn3_blackwell")
+                print("Sage Attention 3 has been detected but it won't work until Triton is installed.")
+            except ImportError:
+                pass
 
 @torch.compiler.disable()
 def sageattn3_wrapper(
@@ -129,7 +232,8 @@ def sageattn3_wrapper(
 def sdpa_wrapper(
         qkv_list,
         attention_length,
-        attention_mask = None        
+        attention_mask = None,
+        causal = False,
     ):
     q, k, v = qkv_list
 
@@ -138,7 +242,7 @@ def sdpa_wrapper(
     v = v.transpose(1,2)
     if attention_mask != None:
         attention_mask = attention_mask.transpose(1,2)
-    o = F.scaled_dot_product_attention( q, k, v, attn_mask=attention_mask, is_causal=False).transpose(1,2)
+    o = F.scaled_dot_product_attention(q, k, v, attn_mask=attention_mask, is_causal=causal).transpose(1,2)
     del q, k ,v
     qkv_list.clear()
 
@@ -164,31 +268,125 @@ def get_attention_modes():
     return ret
 
 def get_supported_attention_modes():
+    # MPS compatibility: only SDPA is supported on Apple Silicon
+    if _is_mps:
+        return ["sdpa", "auto"]
     ret = get_attention_modes()
     major, minor = torch.cuda.get_device_capability()
-    if  major < 10:
+    if  major < 10 or not triton_installed:
         if "sage3" in ret:
             ret.remove("sage3")
 
-    if not sage2_supported:
+    if not sage2_supported or not triton_installed:
         if "sage2" in ret:
             ret.remove("sage2")
         if "radial" in ret:
             ret.remove("radial")
 
-    if  major < 7:
+    if major < 7 or not triton_installed:
         if "sage" in ret:
             ret.remove("sage")
 
     return ret
 
+
+def get_override_attention_modes():
+    return get_attention_modes() + [mode for mode, status in ATTENTION_MODE_AVAILABILITY.items() if status["installed"]]
+
+
+def get_supported_override_attention_modes():
+    return get_supported_attention_modes() + [mode for mode, status in ATTENTION_MODE_AVAILABILITY.items() if status["supported"]]
+
+
+def get_default_attention_mode():
+    for attn in ("sage2", "sage", "sdpa"):
+        if attn in get_supported_attention_modes():
+            return attn
+    return "sdpa"
+
+
+def get_current_cuda_architecture(device=None):
+    if _is_mps or not torch.cuda.is_available():
+        return None
+    major, minor = torch.cuda.get_device_capability(device)
+    return major * 10 + minor
+
+
+_SAGE_ATTENTION_MODES = {"sage", "sage2", "sage3", "radial"}
+
+
+def resolve_attention_mode(attention_mode=None, disable_sage_pre_ada=False):
+    attn = str(attention_mode or "auto").strip().lower()
+    attn = get_default_attention_mode() if attn == "auto" else attn
+    architecture = get_current_cuda_architecture() if disable_sage_pre_ada else None
+    if architecture is not None and architecture < 89 and attn in _SAGE_ATTENTION_MODES:
+        attn = "sdpa"
+    if attn not in get_supported_attention_modes():
+        raise ValueError(f"Attention mode '{attn}' is not installed or supported on this system.")
+    return attn
+
+
+@contextmanager
+def attention_shared_state(default_attention=None):
+    previous = offload.shared_state.get("_attention", _MISSING)
+    if previous is _MISSING or previous == "auto":
+        offload.shared_state["_attention"] = default_attention or get_default_attention_mode()
+    else:
+        offload.shared_state["_attention"] = previous
+    try:
+        yield
+    finally:
+        if previous is _MISSING:
+            offload.shared_state.pop("_attention", None)
+        else:
+            offload.shared_state["_attention"] = previous
+
+
+@contextmanager
+def attention_config_shared_state(attention_mode=None, resolver=resolve_attention_mode, **resolver_kwargs):
+    previous = offload.shared_state.get("_attention", _MISSING)
+    offload.shared_state["_attention"] = resolver(attention_mode, **resolver_kwargs)
+    try:
+        yield offload.shared_state["_attention"]
+    finally:
+        if previous is _MISSING:
+            offload.shared_state.pop("_attention", None)
+        else:
+            offload.shared_state["_attention"] = previous
+
+def sage_staged(device, head_dim, force_attention=None, masked=False):
+    """(core, settings) of the staged_* functions (q, k and v quantized as soon as each is computed) of the SageAttention that
+    pay_attention would run without sequence lengths on this device (with this force_attention, and a mask when masked):
+    shared.sage2_core for SageAttention 2, shared.sage1_core for SageAttention without a mask; None otherwise."""
+    attn = force_attention or offload.shared_state["_attention"]
+    if attn == "veda":
+        attn = offload.shared_state.get("_attention_fallback") or get_default_attention_mode()
+    attn = get_default_attention_mode() if attn in ("sol", "vdn") else attn
+    if attn == "sage":
+        return None if masked or sage1_core is None or head_dim not in sage1_core.HEAD_DIMS else (sage1_core, sage1_core.SETTINGS)
+    if attn not in ("sage2", "radial") or sageattn2 is None or masked and sageattn_attention_mask_support_reason(device=device) is not None:
+        return None
+    settings = sage2_core.staged_settings(device, masked)
+    return None if settings is None else (sage2_core, settings)
+
 __all__ = [
+    'ATTENTION_MODE_AVAILABILITY',
+    'attention_config_shared_state',
+    'attention_shared_state',
+    'get_current_cuda_architecture',
+    'get_override_attention_modes',
+    'get_supported_override_attention_modes',
+    'resolve_attention_mode',
     'pay_attention',
+    'sage_staged',
+    'sage_attention_mask',
     'attention',
 ]
 
 def get_cu_seqlens(batch_size, lens, max_len):
-    cu_seqlens = torch.zeros([2 * batch_size + 1], dtype=torch.int32, device="cuda")
+    # MPS compatibility: use dynamic device detection
+    _cu_device = "mps" if _is_mps else "cuda"
+    cu_seqlens = torch.zeros([2 * batch_size + 1], dtype=torch.int32, device=_cu_device)
 
     for i in range(batch_size):
         s = lens[i] 
@@ -210,18 +408,41 @@ def pay_attention(
     version=None,
     force_attention= None,
     attention_mask = None,
-    cross_attn= False,
+    recycle_q = False,
     q_lens = None,
     k_lens = None,
 ):
+    global _MASKED_ATTENTION_SDPA_WARNED
     # format : torch.Size([batches, tokens, heads, head_features])
     # assume if q_lens is non null, each q is padded up to lq (one q out of two will need to be discarded or ignored)
     # assume if k_lens is non null, each k is padded up to lk (one k out of two will need to be discarded or ignored)
+    if attention_mask is not None and causal:
+        raise ValueError("pay_attention received both attention_mask and causal=True; build a combined mask once and pass causal=False.")
     if attention_mask != None:
-        force_attention = "sdpa"
+        requested_attn = offload.shared_state["_attention"] if force_attention == None else force_attention
+        if requested_attn == "veda":
+            requested_attn = offload.shared_state.get("_attention_fallback") or get_default_attention_mode()
+        requested_attn = get_default_attention_mode() if requested_attn in ("sol", "vdn") else requested_attn
+        requested_attn = "sage2" if requested_attn == "radial" else requested_attn
+        support_reason = None
+        if _is_mps:
+            support_reason = "MPS uses SDPA for masked attention"
+        elif requested_attn == "sage2" and sageattn2 != None and q_lens == None and k_lens == None:
+            support_reason = sageattn_attention_mask_support_reason(qkv_list, attention_mask, tensor_layout="NHD")
+        if requested_attn == "sage2" and support_reason is None and sageattn2 != None and q_lens == None and k_lens == None:
+            force_attention = "sage2"
+        else:
+            force_attention = "sdpa"
+            if requested_attn != "sdpa" and not _MASKED_ATTENTION_SDPA_WARNED:
+                detail = f" ({support_reason})" if support_reason else ""
+                print(f"[WAN2GP] Attention mask is unsupported by selected attention '{requested_attn}'{detail}. Masked attention will use SDPA.")
+                _MASKED_ATTENTION_SDPA_WARNED = True
         if  attention_mask.dtype == torch.bfloat16 and not bfloat16_supported:
             attention_mask = attention_mask.to(torch.float16)
     attn = offload.shared_state["_attention"] if force_attention== None else force_attention
+    if attn == "veda":
+        attn = offload.shared_state.get("_attention_fallback") or get_default_attention_mode()
+    attn = get_default_attention_mode() if attn in ("sol", "vdn") else attn
 
     q,k,v = qkv_list
     qkv_list.clear()
@@ -238,10 +459,13 @@ def pay_attention(
     batch = len(q)
     if len(k) != batch: k = k.expand(batch, -1, -1, -1)
     if len(v) != batch: v = v.expand(batch, -1, -1, -1)
+    if q.device.type == "mps": q, k, v = q.contiguous(), k.contiguous(),v.contiguous()
     if attn == "chipmunk":
         from src.chipmunk.modules import SparseDiffMlp, SparseDiffAttn
         from src.chipmunk.util import LayerCounter, GLOBAL_CONFIG
     if attn == "radial": attn ="sage2"
+    # a block recorded for a CUDA graph: Sage 3 kernels, which are not known to run on PyTorch's current stream, give way to Sage 2
+    if attn == "sage3" and sageattn2 is not None and cuda_graphs.recording(): attn = "sage2"
 
     if b > 1 and k_lens != None and attn in ("sage2", "sage3", "sdpa"):
         assert attention_mask == None
@@ -290,12 +514,14 @@ def pay_attention(
             'Flash attention 3 is not available, use flash attention 2 instead.'
         )
 
-    if attn=="sage" or attn=="flash":
+    # SageAttention on every batch item with all its tokens: its kernels without its device sync (CUDA graphs can record them)
+    sage_rows = attn == "sage" and q_lens == None and k_lens == None and not causal and softmax_scale is None and q.shape[-1] in sage1_core.HEAD_DIMS
+    if attn=="sage" and not sage_rows or attn=="flash":
         if b != 1 :
             if k_lens == None:
-                k_lens = torch.tensor( [lk] * b, dtype=torch.int32).to(device=q.device, non_blocking=True)
+                k_lens = torch.full((b,), lk, dtype=torch.int32, device=q.device)  # made on the GPU: no host copy (not allowed in CUDA graphs)
             if q_lens == None:
-                q_lens = torch.tensor([lq] * b, dtype=torch.int32).to(device=q.device, non_blocking=True)
+                q_lens = torch.full((b,), lq, dtype=torch.int32, device=q.device)
             k = k.reshape(-1, *k.shape[-2:])
             v = v.reshape(-1, *v.shape[-2:])
             q = q.reshape(-1, *q.shape[-2:])
@@ -305,18 +531,22 @@ def pay_attention(
             szq = q_lens[0].item() if q_lens != None else lq
             szk = k_lens[0].item() if k_lens != None else lk
             if szq != lq or szk != lk:
-                cu_seqlens_q = torch.tensor([0, szq, lq], dtype=torch.int32, device="cuda")
-                cu_seqlens_k = torch.tensor([0, szk, lk], dtype=torch.int32, device="cuda")
+                cu_seqlens_q = torch.tensor([0, szq, lq], dtype=torch.int32, device=q.device)
+                cu_seqlens_k = torch.tensor([0, szk, lk], dtype=torch.int32, device=q.device)
             else:
-                cu_seqlens_q = torch.tensor([0, lq], dtype=torch.int32, device="cuda")
-                cu_seqlens_k = torch.tensor([0, lk], dtype=torch.int32, device="cuda")
+                cu_seqlens_q = torch.arange(0, 2 * lq, lq, dtype=torch.int32, device=q.device)  # [0, lq] made on the GPU: no host copy (not allowed in CUDA graphs)
+                cu_seqlens_k = torch.arange(0, 2 * lk, lk, dtype=torch.int32, device=q.device)
             q = q.squeeze(0)
             k = k.squeeze(0)
             v = v.squeeze(0)
 
 
     # apply attention
-    if attn=="sage":
+    if sage_rows:
+        qkv_list = [t.reshape(-1, *t.shape[2:]).view(t.shape) for t in (q, k, v)]  # batch items one after another (copies only otherwise)
+        del q, k, v
+        x = sage1_core.attention(qkv_list, recycle_q)
+    elif attn=="sage":
         x = sageattn_varlen_wrapper(
             q=q,
             k=k,
@@ -325,83 +555,22 @@ def pay_attention(
             cu_seqlens_kv= cu_seqlens_k,
             max_seqlen_q=lq,
             max_seqlen_kv=lk,
+            is_causal=causal,
+            sm_scale=softmax_scale,
         ).unflatten(0, (b, lq))
     elif attn=="sage3":
-        import math
-        if cross_attn or True:
-            qkv_list = [q,k,v]
-            del q,k,v
-            x = sageattn3_wrapper(qkv_list, lq)
+        qkv_list = [q,k,v]
+        del q,k,v
+        x = sageattn3_wrapper(qkv_list, lq)
     elif attn=="sage2":
-        import math
-        if cross_attn or True:
-            qkv_list = [q,k,v]
-            del q,k,v
-
-            x = sageattn2_wrapper(qkv_list, lq) #.unsqueeze(0)
-        # else:
-        #     layer =  offload.shared_state["layer"]
-        #     embed_sizes = offload.shared_state["embed_sizes"] 
-        #     current_step = offload.shared_state["step_no"] 
-        #     max_steps = offload.shared_state["max_steps"]  
-
-
-        #     nb_latents =  embed_sizes[0] * embed_sizes[1]* embed_sizes[2]
-
-        #     window = 0
-        #     start_window_step = int(max_steps * 0.3)
-        #     start_layer = 10
-        #     end_layer = 30
-        #     if (layer < start_layer or layer > end_layer )  or current_step <start_window_step: 
-        #         window = 0
-        #     else:
-        #         # coef =  min((max_steps - current_step)/(max_steps-start_window_step),1)*max(min((25 - layer)/(25-start_layer),1),0) * 0.7 + 0.3
-        #         coef = 0.3
-        #         print(f"step: {current_step}, layer: {layer}, coef:{coef:0.1f}]")
-        #         window =  math.ceil(coef* nb_latents)
-
-        #     invert_spaces = (layer + current_step) % 2 == 0 and window > 0
-        #     invert_spaces = False
-        #     def flip(q):
-        #         q = q.reshape(*embed_sizes, *q.shape[-2:])
-        #         q = q.transpose(0,2)
-        #         q = q.contiguous()
-        #         q = q.transpose(0,2)
-        #         q = q.reshape( -1, *q.shape[-2:])
-        #         return q
-
-        #     def flop(q):
-        #         q = q.reshape(embed_sizes[2], embed_sizes[1], embed_sizes[0] , *q.shape[-2:])
-        #         q = q.transpose(0,2)
-        #         q = q.contiguous()
-        #         q = q.transpose(0,2)
-        #         q = q.reshape( -1, *q.shape[-2:])
-        #         return q
-
-
-        #     if invert_spaces:
-
-        #         q = flip(q)
-        #         k = flip(k)
-        #         v = flip(v)            
-        #     qkv_list = [q,k,v]
-        #     del q,k,v
-
-
-
-        #     x = sageattn_window_wrapper(qkv_list, lq, window= window) #.unsqueeze(0)
-
-        #     if invert_spaces:
-        #         x = flop(x)
-        #     x = x.unsqueeze(0)
-
-        
+        qkv_list = [q,k,v]
+        del q,k,v
+        x = sageattn2_wrapper(qkv_list, lq, recycle_q=recycle_q, attention_mask=attention_mask, causal=causal)
     elif attn=="sdpa":
         qkv_list = [q, k, v]
         del q ,k ,v
-        x = sdpa_wrapper( qkv_list, lq, attention_mask = attention_mask) #.unsqueeze(0)
+        x = sdpa_wrapper(qkv_list, lq, attention_mask=attention_mask, causal=causal)
     elif attn=="flash" and version == 3:
-        # Note: dropout_p, window_size are not supported in FA3 now.
         x = flash_attn_interface.flash_attn_varlen_func(
             q=q,
             k=k,

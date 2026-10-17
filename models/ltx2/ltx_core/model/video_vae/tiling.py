@@ -10,6 +10,8 @@ def compute_trapezoidal_mask_1d(
     ramp_left: int,
     ramp_right: int,
     left_starts_from_0: bool = False,
+    *,
+    device: torch.device,
 ) -> torch.Tensor:
     """
     Generate a 1D trapezoidal blending mask with linear ramps.
@@ -19,6 +21,7 @@ def compute_trapezoidal_mask_1d(
         ramp_right: Fade-out length on the right.
         left_starts_from_0: Whether the ramp starts from 0 or first non-zero value.
             Useful for temporal tiles where the first tile is causal.
+        device: Device on which the mask is created.
     Returns:
         A 1D tensor of shape `(length,)` with values in [0, 1].
     """
@@ -28,17 +31,17 @@ def compute_trapezoidal_mask_1d(
     ramp_left = max(0, min(ramp_left, length))
     ramp_right = max(0, min(ramp_right, length))
 
-    mask = torch.ones(length)
+    mask = torch.ones(length, device=device)
 
     if ramp_left > 0:
         interval_length = ramp_left + 1 if left_starts_from_0 else ramp_left + 2
-        fade_in = torch.linspace(0.0, 1.0, interval_length)[:-1]
+        fade_in = torch.linspace(0.0, 1.0, interval_length, device=device)[:-1]
         if not left_starts_from_0:
             fade_in = fade_in[1:]
         mask[:ramp_left] *= fade_in
 
     if ramp_right > 0:
-        fade_out = torch.linspace(1.0, 0.0, steps=ramp_right + 2)[1:-1]
+        fade_out = torch.linspace(1.0, 0.0, steps=ramp_right + 2, device=device)[1:-1]
         mask[-ramp_right:] *= fade_out
 
     return mask.clamp_(0, 1)
@@ -179,6 +182,26 @@ class Tile(NamedTuple):
     in_coords: Tuple[slice, ...]
     out_coords: Tuple[slice, ...]
     masks_1d: Tuple[Tuple[torch.Tensor, ...]]
+
+    @staticmethod
+    def _format_slice(axis_slice: slice) -> str:
+        start = "" if axis_slice.start is None else axis_slice.start
+        stop = "" if axis_slice.stop is None else axis_slice.stop
+        if axis_slice.step is None:
+            return f"{start}:{stop}"
+        return f"{start}:{stop}:{axis_slice.step}"
+
+    @staticmethod
+    def _format_mask(mask_1d: torch.Tensor | None) -> str:
+        if mask_1d is None:
+            return "None"
+        return f"len={mask_1d.numel()}"
+
+    def __repr__(self) -> str:
+        in_coords = ",".join(self._format_slice(axis_slice) for axis_slice in self.in_coords)
+        out_coords = ",".join(self._format_slice(axis_slice) for axis_slice in self.out_coords)
+        masks = ",".join(self._format_mask(mask_1d) for mask_1d in self.masks_1d)
+        return f"Tile(in=({in_coords}), out=({out_coords}), masks=({masks}))"
 
     @property
     def blend_mask(self) -> torch.Tensor:

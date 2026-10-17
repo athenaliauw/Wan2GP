@@ -1,16 +1,41 @@
+# Copyright (c) 2026 DeepBeepMeep - part of WanGP, WanGP Community License 2.0 (see LICENSE.txt)
 import ast
+import functools
 import os
 import re
+import struct
+import sys
+import numpy as np
+from dataclasses import dataclass
+from enum import IntEnum
+from typing import List, Optional
 
 import torch
+from torch._subclasses.fake_tensor import is_fake
 from torch.utils import _pytree as pytree
 
-from optimum.quanto import QModuleMixin
+from optimum.quanto import QModuleMixin, register_qmodule
 from optimum.quanto.tensor.qtensor import QTensor
 from optimum.quanto.tensor.qtype import qtype as _quanto_qtype, qtypes as _quanto_qtypes
+from collections import OrderedDict
+from mmgp import cuda_graphs as _cuda_graphs
+from mmgp.offload import QEmbedding as BaseQEmbedding
 
 
 HANDLER_NAME = "gguf"
+
+
+class PrismQuantizationType(IntEnum):
+    """Prism's extension IDs, without modifying the upstream gguf package."""
+    PTQ1_0 = 143
+
+
+def _quantization_type(value):
+    return PrismQuantizationType(value) if value == 143 else gguf.GGMLQuantizationType(value)
+
+
+def _quantization_sizes(value):
+    return (128, 28) if value == PrismQuantizationType.PTQ1_0 else gguf.GGML_QUANT_SIZES[value]
 
 try:
     import gguf
@@ -32,6 +57,82 @@ _GGUF_QTYPE = _quanto_qtypes[_GGUF_QTYPE_NAME]
 
 _GGUF_DEFAULT_DTYPE = None
 _GGUF_LABEL_CACHE = {}
+_GGUF_METADATA_CACHE = {}
+_GGUF_INDEX_CACHE = {}
+_GGUF_RUNTIME_LOGGED = set()
+_GGUF_DEQUANTIZE_BLOCK_CHUNK = 65536  # At most 16M decoded values per standard K/IQ chunk.
+_GGUF_CUDA_KERNELS_ENV = "WGP_GGUF_LLAMACPP_CUDA"
+_GGUF_CUDA_KERNELS_ENABLED_CACHE = None
+_GGUF_CUDA_MODULE = None
+_GGUF_CUDA_LOAD_ERROR = None
+_GGUF_NATIVE_BYTE_ORDER = "<" if sys.byteorder == "little" else ">"
+_GGUF_ORIG_SHAPE_PREFIX = "comfy.gguf.orig_shape."
+_GGUF_FAST_METADATA_SCALARS = {
+    None if gguf is None else gguf.GGUFValueType.UINT8: np.uint8,
+    None if gguf is None else gguf.GGUFValueType.INT8: np.int8,
+    None if gguf is None else gguf.GGUFValueType.UINT16: np.uint16,
+    None if gguf is None else gguf.GGUFValueType.INT16: np.int16,
+    None if gguf is None else gguf.GGUFValueType.UINT32: np.uint32,
+    None if gguf is None else gguf.GGUFValueType.INT32: np.int32,
+    None if gguf is None else gguf.GGUFValueType.FLOAT32: np.float32,
+    None if gguf is None else gguf.GGUFValueType.BOOL: np.bool_,
+    None if gguf is None else gguf.GGUFValueType.UINT64: np.uint64,
+    None if gguf is None else gguf.GGUFValueType.INT64: np.int64,
+    None if gguf is None else gguf.GGUFValueType.FLOAT64: np.float64,
+}
+_GGUF_FAST_METADATA_STRUCT_FORMATS = {
+    None if gguf is None else gguf.GGUFValueType.UINT8: "B",
+    None if gguf is None else gguf.GGUFValueType.INT8: "b",
+    None if gguf is None else gguf.GGUFValueType.UINT16: "H",
+    None if gguf is None else gguf.GGUFValueType.INT16: "h",
+    None if gguf is None else gguf.GGUFValueType.UINT32: "I",
+    None if gguf is None else gguf.GGUFValueType.INT32: "i",
+    None if gguf is None else gguf.GGUFValueType.FLOAT32: "f",
+    None if gguf is None else gguf.GGUFValueType.BOOL: "?",
+    None if gguf is None else gguf.GGUFValueType.UINT64: "Q",
+    None if gguf is None else gguf.GGUFValueType.INT64: "q",
+    None if gguf is None else gguf.GGUFValueType.FLOAT64: "d",
+}
+_GGUF_TYPED_TENSOR_DTYPES = {
+    None if gguf is None else gguf.GGMLQuantizationType.F16: np.float16,
+    None if gguf is None else gguf.GGMLQuantizationType.F32: np.float32,
+    None if gguf is None else gguf.GGMLQuantizationType.F64: np.float64,
+    None if gguf is None else gguf.GGMLQuantizationType.I8: np.int8,
+    None if gguf is None else gguf.GGMLQuantizationType.I16: np.int16,
+    None if gguf is None else gguf.GGMLQuantizationType.I32: np.int32,
+    None if gguf is None else gguf.GGMLQuantizationType.I64: np.int64,
+}
+_GGUF_TYPED_TENSOR_TORCH_DTYPES = {
+    None if gguf is None else gguf.GGMLQuantizationType.F16: torch.float16,
+    None if gguf is None else gguf.GGMLQuantizationType.BF16: torch.bfloat16,
+    None if gguf is None else gguf.GGMLQuantizationType.F32: torch.float32,
+    None if gguf is None else gguf.GGMLQuantizationType.F64: torch.float64,
+    None if gguf is None else gguf.GGMLQuantizationType.I8: torch.int8,
+    None if gguf is None else gguf.GGMLQuantizationType.I16: torch.int16,
+    None if gguf is None else gguf.GGMLQuantizationType.I32: torch.int32,
+    None if gguf is None else gguf.GGMLQuantizationType.I64: torch.int64,
+}
+
+
+@dataclass(frozen=True)
+class _GGUFTensorInfo:
+    name: str
+    tensor_type: object
+    raw_shape: tuple[int, ...]
+    data_offset: int
+    n_elements: int
+    n_bytes: int
+
+
+@dataclass(frozen=True)
+class _GGUFParsedIndex:
+    byte_order: str
+    data_alignment: int
+    data_offset: int
+    tensor_infos: tuple[_GGUFTensorInfo, ...]
+    config: object | None
+    orig_shapes: tuple[tuple[str, tuple[int, ...]], ...]
+    prism_metadata: tuple = ()
 
 
 def _normalize_gguf_path(file_path):
@@ -55,21 +156,375 @@ def _set_default_dtype_from_loader(dtype):
 def _resolve_default_dtype(dtype, fallback=None):
     if dtype is None:
         return _GGUF_DEFAULT_DTYPE or fallback
-    if _GGUF_DEFAULT_DTYPE is not None and fallback is not None and dtype == fallback:
-        return _GGUF_DEFAULT_DTYPE
     return dtype
-def read_gguf_metadata(file_path):
+
+
+def _gguf_log_once(key, message):
+    if key in _GGUF_RUNTIME_LOGGED:
+        return
+    _GGUF_RUNTIME_LOGGED.add(key)
+    print(message)
+
+
+def _gguf_cuda_env_enabled():
+    raw = str(os.environ.get(_GGUF_CUDA_KERNELS_ENV, "1")).strip().lower()
+    return raw in ("1", "true", "yes", "y", "on")
+
+
+def _validate_gguf_cuda_module(module):
+    import numpy as np
+
+    if gguf is None:
+        raise RuntimeError("gguf package is unavailable")
+    if not torch.cuda.is_available():
+        raise RuntimeError("CUDA is not available")
+    if not module.may_support_linear_qtype_name("Q4_0"):
+        raise RuntimeError("Q4_0 linear is not supported by the installed GGUF CUDA package")
+
+    weight = np.linspace(-1.0, 1.0, 32, dtype=np.float32).reshape(1, 32)
+    quantized_weight = gguf.quants.quantize(weight, gguf.GGMLQuantizationType.Q4_0)
+    raw_weight = torch.from_numpy(quantized_weight).contiguous().cuda()
+    input_tensor = torch.linspace(-0.5, 0.5, 64, dtype=torch.float32, device="cuda").reshape(2, 32)
+    fast_out = module.linear(raw_weight, "Q4_0", [1, 32], input_tensor, None, torch.float32)
+    dense_weight = torch.from_numpy(gguf.quants.dequantize(quantized_weight, gguf.GGMLQuantizationType.Q4_0)).to(device=input_tensor.device, dtype=torch.float32)
+    ref_out = torch.nn.functional.linear(input_tensor, dense_weight, None)
+    torch.cuda.synchronize()
+    if fast_out.shape != ref_out.shape:
+        raise RuntimeError(f"Q4 self-test shape mismatch: {tuple(fast_out.shape)} vs {tuple(ref_out.shape)}")
+    if not torch.allclose(fast_out, ref_out, atol=2e-2, rtol=2e-2):
+        max_diff = float((fast_out - ref_out).abs().max().item())
+        raise RuntimeError(f"Q4 self-test output mismatch (max diff {max_diff:.6f})")
+
+
+def _probe_gguf_cuda_runtime(force=False):
+    global _GGUF_CUDA_KERNELS_ENABLED_CACHE, _GGUF_CUDA_MODULE, _GGUF_CUDA_LOAD_ERROR
+    if not force and not _gguf_cuda_env_enabled():
+        _GGUF_CUDA_KERNELS_ENABLED_CACHE = False
+        _GGUF_CUDA_MODULE = None
+        _GGUF_CUDA_LOAD_ERROR = None
+        return False
+    try:
+        import llamacpp_gguf_cuda as gguf_cuda_module
+        _validate_gguf_cuda_module(gguf_cuda_module)
+    except Exception as exc:
+        _GGUF_CUDA_KERNELS_ENABLED_CACHE = False
+        _GGUF_CUDA_MODULE = None
+        _GGUF_CUDA_LOAD_ERROR = f"{type(exc).__name__}: {exc}"  # not the exception: its traceback would keep the callers' frames (the models being loaded) alive
+        _gguf_log_once("gguf_cuda_probe_failed", f"[GGUF][llama.cpp CUDA] kernels unavailable, using fallback")
+        return False
+    _GGUF_CUDA_KERNELS_ENABLED_CACHE = True
+    _GGUF_CUDA_MODULE = gguf_cuda_module
+    _GGUF_CUDA_LOAD_ERROR = None
+    _gguf_log_once("gguf_cuda_probe_ok", "[GGUF][llama.cpp CUDA] kernels available.")
+    return True
+
+
+def _gguf_cuda_kernels_enabled():
+    global _GGUF_CUDA_KERNELS_ENABLED_CACHE
+    if _GGUF_CUDA_KERNELS_ENABLED_CACHE is not None:
+        return _GGUF_CUDA_KERNELS_ENABLED_CACHE
+    return _probe_gguf_cuda_runtime()
+
+
+def _gguf_cuda_module():
+    if not _gguf_cuda_kernels_enabled():
+        return None
+    return _GGUF_CUDA_MODULE
+
+
+def get_gguf_compute_dtype():
+    module = _gguf_cuda_module()
+    if module is None:
+        return torch.bfloat16
+    try:
+        version = tuple(int(part) for part in module.__version__.split("+", 1)[0].split(".")[:3])
+    except (AttributeError, TypeError, ValueError):
+        return torch.float16
+    return torch.bfloat16 if version >= (1, 0, 7) else torch.float16
+
+
+def set_gguf_cuda_kernels_enabled(enabled=None):
+    global _GGUF_CUDA_KERNELS_ENABLED_CACHE, _GGUF_CUDA_MODULE, _GGUF_CUDA_LOAD_ERROR
+    if enabled is False:
+        _GGUF_CUDA_KERNELS_ENABLED_CACHE = False
+        _GGUF_CUDA_MODULE = None
+        _GGUF_CUDA_LOAD_ERROR = None
+        return
+    _GGUF_CUDA_KERNELS_ENABLED_CACHE = None
+    _GGUF_CUDA_MODULE = None
+    _GGUF_CUDA_LOAD_ERROR = None
+    if enabled is None:
+        return _probe_gguf_cuda_runtime()
+    return _probe_gguf_cuda_runtime(force=True)
+
+
+def _gguf_read_array(data, offset, dtype, byte_order):
+    dtype = np.dtype(dtype).newbyteorder(byte_order)
+    value = np.frombuffer(data, dtype=dtype, count=1, offset=offset)
+    return value, offset + int(value.nbytes)
+
+
+def _gguf_read_string_fast(data, offset, byte_order):
+    str_len_arr, offset = _gguf_read_array(data, offset, np.uint64, byte_order)
+    str_len = int(str_len_arr[0])
+    raw = bytes(data[offset : offset + str_len])
+    return raw.decode("utf-8"), offset + str_len
+
+
+def _gguf_decode_value_fast(data, offset, raw_type, byte_order):
+    value_type = gguf.GGUFValueType(int(raw_type))
+    scalar_dtype = _GGUF_FAST_METADATA_SCALARS.get(value_type)
+    if scalar_dtype is not None:
+        value_arr, offset = _gguf_read_array(data, offset, scalar_dtype, byte_order)
+        value = value_arr[0]
+        return (bool(value) if value_type == gguf.GGUFValueType.BOOL else value.item()), offset
+    if value_type == gguf.GGUFValueType.STRING:
+        return _gguf_read_string_fast(data, offset, byte_order)
+    if value_type == gguf.GGUFValueType.ARRAY:
+        item_type_arr, offset = _gguf_read_array(data, offset, np.uint32, byte_order)
+        item_count_arr, offset = _gguf_read_array(data, offset, np.uint64, byte_order)
+        item_type = int(item_type_arr[0])
+        item_count = int(item_count_arr[0])
+        items = []
+        for _ in range(item_count):
+            item, offset = _gguf_decode_value_fast(data, offset, item_type, byte_order)
+            items.append(item)
+        return items, offset
+    raise ValueError(f"Unsupported GGUF metadata field type: {value_type}")
+
+
+def _gguf_stream_read_exact(reader, size):
+    data = reader.read(int(size))
+    if len(data) != int(size):
+        raise EOFError("Unexpected end of GGUF metadata header.")
+    return data
+
+
+def _gguf_stream_unpack(reader, fmt):
+    return struct.unpack(fmt, _gguf_stream_read_exact(reader, struct.calcsize(fmt)))
+
+
+def _gguf_read_string_stream(reader, byte_order):
+    str_len = int(_gguf_stream_unpack(reader, byte_order + "Q")[0])
+    return _gguf_stream_read_exact(reader, str_len).decode("utf-8")
+
+
+def _gguf_decode_value_stream(reader, raw_type, byte_order):
+    value_type = gguf.GGUFValueType(int(raw_type))
+    scalar_fmt = _GGUF_FAST_METADATA_STRUCT_FORMATS.get(value_type)
+    if scalar_fmt is not None:
+        return _gguf_stream_unpack(reader, byte_order + scalar_fmt)[0]
+    if value_type == gguf.GGUFValueType.STRING:
+        return _gguf_read_string_stream(reader, byte_order)
+    if value_type == gguf.GGUFValueType.ARRAY:
+        item_type = int(_gguf_stream_unpack(reader, byte_order + "I")[0])
+        item_count = int(_gguf_stream_unpack(reader, byte_order + "Q")[0])
+        return [_gguf_decode_value_stream(reader, item_type, byte_order) for _ in range(item_count)]
+    raise ValueError(f"Unsupported GGUF metadata field type: {value_type}")
+
+
+def _gguf_stream_skip(reader, size):
+    if int(size) <= 0:
+        return
+    reader.seek(int(size), os.SEEK_CUR)
+
+
+def _gguf_skip_value_stream(reader, raw_type, byte_order):
+    value_type = gguf.GGUFValueType(int(raw_type))
+    scalar_fmt = _GGUF_FAST_METADATA_STRUCT_FORMATS.get(value_type)
+    if scalar_fmt is not None:
+        _gguf_stream_skip(reader, struct.calcsize(byte_order + scalar_fmt))
+        return
+    if value_type == gguf.GGUFValueType.STRING:
+        str_len = int(_gguf_stream_unpack(reader, byte_order + "Q")[0])
+        _gguf_stream_skip(reader, str_len)
+        return
+    if value_type == gguf.GGUFValueType.ARRAY:
+        item_type = int(_gguf_stream_unpack(reader, byte_order + "I")[0])
+        item_count = int(_gguf_stream_unpack(reader, byte_order + "Q")[0])
+        item_value_type = gguf.GGUFValueType(item_type)
+        item_scalar_fmt = _GGUF_FAST_METADATA_STRUCT_FORMATS.get(item_value_type)
+        if item_scalar_fmt is not None:
+            _gguf_stream_skip(reader, struct.calcsize(byte_order + item_scalar_fmt) * item_count)
+            return
+        if item_value_type == gguf.GGUFValueType.STRING:
+            for _ in range(item_count):
+                item_len = int(_gguf_stream_unpack(reader, byte_order + "Q")[0])
+                _gguf_stream_skip(reader, item_len)
+            return
+        for _ in range(item_count):
+            _gguf_skip_value_stream(reader, item_type, byte_order)
+        return
+    raise ValueError(f"Unsupported GGUF metadata field type: {value_type}")
+
+
+def _gguf_quant_byte_shape(shape, tensor_type):
+    if len(shape) == 0:
+        return tuple(shape)
+    block_size, type_size = _quantization_sizes(tensor_type)
+    last_dim = int(shape[-1])
+    if block_size <= 0 or last_dim % block_size != 0:
+        raise ValueError(f"Invalid GGUF tensor shape {tuple(shape)} for tensor type {getattr(tensor_type, 'name', tensor_type)}")
+    return tuple(int(dim) for dim in shape[:-1]) + (last_dim // block_size * type_size,)
+
+
+def _gguf_cache_identity(file_path):
+    try:
+        stat = os.stat(file_path)
+    except OSError:
+        return None
+    return (int(stat.st_size), int(getattr(stat, "st_mtime_ns", int(stat.st_mtime * 1e9))))
+
+
+def _gguf_parse_index(file_path):
     if gguf is None:
         raise RuntimeError("GGUF support requires the 'gguf' package.")
-    reader = gguf.GGUFReader(file_path)
+    with open(file_path, "rb") as reader:
+        magic = int(_gguf_stream_unpack(reader, "<I")[0])
+        if magic != int(gguf.GGUF_MAGIC):
+            raise ValueError("GGUF magic invalid")
+        version_le = int(_gguf_stream_unpack(reader, "<I")[0])
+        byte_order = ">" if (version_le & 0xFFFF) == 0 else "<"
+        tensor_count = int(_gguf_stream_unpack(reader, byte_order + "Q")[0])
+        kv_count = int(_gguf_stream_unpack(reader, byte_order + "Q")[0])
+        data_alignment = int(getattr(gguf, "GGUF_DEFAULT_ALIGNMENT", 32))
+        config = None
+        orig_shapes = {}
+        prism_metadata = {}
+        for _ in range(kv_count):
+            key = _gguf_read_string_stream(reader, byte_order)
+            raw_type = int(_gguf_stream_unpack(reader, byte_order + "I")[0])
+            if key == "general.alignment":
+                data_alignment = int(_gguf_decode_value_stream(reader, raw_type, byte_order))
+                continue
+            if key == "config":
+                config = _gguf_decode_value_stream(reader, raw_type, byte_order)
+                continue
+            if key.startswith("prism.hadamard."):
+                prism_metadata[key] = _gguf_decode_value_stream(reader, raw_type, byte_order)
+                continue
+            if key.startswith(_GGUF_ORIG_SHAPE_PREFIX):
+                value = _gguf_decode_value_stream(reader, raw_type, byte_order)
+                if isinstance(value, (list, tuple)):
+                    tensor_name = key[len(_GGUF_ORIG_SHAPE_PREFIX):]
+                    orig_shapes[tensor_name] = tuple(int(dim) for dim in value)
+                continue
+            _gguf_skip_value_stream(reader, raw_type, byte_order)
+
+        tensor_infos = []
+        for _ in range(tensor_count):
+            name = _gguf_read_string_stream(reader, byte_order)
+            n_dims = int(_gguf_stream_unpack(reader, byte_order + "I")[0])
+            raw_shape = tuple(int(_gguf_stream_unpack(reader, byte_order + "Q")[0]) for _ in range(n_dims))
+            tensor_type = _quantization_type(int(_gguf_stream_unpack(reader, byte_order + "I")[0]))
+            rel_offset = int(_gguf_stream_unpack(reader, byte_order + "Q")[0])
+            n_elements = 1
+            for dim in raw_shape:
+                n_elements *= int(dim)
+            block_size, type_size = _quantization_sizes(tensor_type)
+            n_bytes = int(n_elements * type_size // block_size)
+            tensor_infos.append(
+                _GGUFTensorInfo(
+                    name=name,
+                    tensor_type=tensor_type,
+                    raw_shape=raw_shape,
+                    data_offset=rel_offset,
+                    n_elements=n_elements,
+                    n_bytes=n_bytes,
+                )
+            )
+
+        data_offset = int(reader.tell())
+        padding = data_offset % data_alignment
+        if padding != 0:
+            data_offset += data_alignment - padding
+        tensor_infos = tuple(
+            _GGUFTensorInfo(
+                name=info.name,
+                tensor_type=info.tensor_type,
+                raw_shape=info.raw_shape,
+                data_offset=data_offset + info.data_offset,
+                n_elements=info.n_elements,
+                n_bytes=info.n_bytes,
+            )
+            for info in tensor_infos
+        )
+        return _GGUFParsedIndex(
+            byte_order=byte_order,
+            data_alignment=data_alignment,
+            data_offset=data_offset,
+            tensor_infos=tensor_infos,
+            config=config,
+            orig_shapes=tuple((name, shape) for name, shape in orig_shapes.items()),
+            prism_metadata=tuple(prism_metadata.items()),
+        )
+
+
+def _gguf_get_index(file_path):
+    cache_key = _normalize_gguf_path(file_path)
+    identity = _gguf_cache_identity(file_path)
+    cached = _GGUF_INDEX_CACHE.get(cache_key)
+    if cached is not None and cached[0] == identity:
+        return cached[1]
+    parsed = _gguf_parse_index(file_path)
+    _GGUF_INDEX_CACHE[cache_key] = (identity, parsed)
+    return parsed
+
+
+def _gguf_open_tensor_numpy(mmap_data, index, tensor_info):
+    logical_shape = tuple(int(dim) for dim in reversed(tensor_info.raw_shape))
+    tensor_type = tensor_info.tensor_type
+    np_dtype = _GGUF_TYPED_TENSOR_DTYPES.get(tensor_type)
+    if np_dtype is None:
+        byte_shape = _gguf_quant_byte_shape(logical_shape, tensor_type)
+        return np.ndarray(shape=byte_shape, dtype=np.uint8, buffer=mmap_data, offset=tensor_info.data_offset)
+    dtype = np.dtype(np_dtype)
+    if index.byte_order != _GGUF_NATIVE_BYTE_ORDER:
+        dtype = dtype.newbyteorder(index.byte_order)
+        return np.ndarray(shape=logical_shape, dtype=dtype, buffer=mmap_data, offset=tensor_info.data_offset).byteswap().newbyteorder()
+    return np.ndarray(shape=logical_shape, dtype=dtype, buffer=mmap_data, offset=tensor_info.data_offset)
+
+
+def _get_lightweight_gguf_metadata(file_path):
+    try:
+        parsed = _gguf_get_index(file_path)
+    except Exception:
+        return {}
     metadata = {}
-    field = reader.get_field("config")
-    if field is not None:
-        try:
-            metadata["config"] = field.contents() if callable(getattr(field, "contents", None)) else field.contents
-        except Exception:
-            pass
+    if parsed.config is not None:
+        metadata["config"] = parsed.config
     return metadata
+
+
+def ensure_gguf_handler_registered() -> None:
+    try:
+        from mmgp import quant_router
+    except Exception:
+        return
+    quant_router.register_handler(__name__)
+    quant_router.register_file_extension("gguf", sys.modules[__name__])
+
+
+ensure_gguf_handler_registered()
+
+def get_file_metadata(file_path):
+    if gguf is None:
+        raise RuntimeError("GGUF support requires the 'gguf' package.")
+    cache_key = _normalize_gguf_path(file_path)
+    cached = _GGUF_METADATA_CACHE.get(cache_key)
+    if cached is not None:
+        state_dict, metadata = cached
+        return OrderedDict(state_dict), dict(metadata)
+    from mmgp.safetensors2 import tensor_stub
+    parsed = _gguf_get_index(file_path)
+    orig_shapes = dict(parsed.orig_shapes)
+    state_dict = OrderedDict((tensor.name, tensor_stub(_GGUF_TYPED_TENSOR_TORCH_DTYPES.get(tensor.tensor_type, torch.uint8),
+                                                       orig_shapes.get(tensor.name, tuple(reversed(tensor.raw_shape)))))
+                             for tensor in parsed.tensor_infos)
+    metadata = {"config": parsed.config} if parsed.config is not None else {}
+    result = (state_dict, metadata)
+    _GGUF_METADATA_CACHE[cache_key] = (OrderedDict(result[0]), dict(result[1]))
+    return OrderedDict(result[0]), dict(result[1])
 
 
 def _filter_state_dict_basic(state_dict, base_model_prefix, keep_prefix=False):
@@ -96,18 +551,6 @@ def _filter_state_dict_basic(state_dict, base_model_prefix, keep_prefix=False):
     return new_state_dict
 
 
-def _gguf_get_orig_shape(reader, tensor_name):
-    if gguf is None:
-        raise RuntimeError("GGUF support requires the 'gguf' package.")
-    field_key = f"comfy.gguf.orig_shape.{tensor_name}"
-    field = reader.get_field(field_key)
-    if field is None:
-        return None
-    if len(field.types) != 2 or field.types[0] != gguf.GGUFValueType.ARRAY or field.types[1] != gguf.GGUFValueType.INT32:
-        raise TypeError(f"Bad GGUF shape metadata for {field_key}: {field.types}")
-    return torch.Size(tuple(int(field.parts[part_idx][0]) for part_idx in field.data))
-
-
 def _gguf_resolve_prefix(tensor_names, prefixes):
     for prefix in prefixes:
         if any(name.startswith(prefix) for name in tensor_names):
@@ -119,7 +562,7 @@ def load_gguf_state_dict(
     file_path,
     filters=None,
     keep_prefixes=False,
-    writable_tensors=True,
+    writable_tensors=False,
     verboseLevel=1,
     default_dtype=None,
     pin_to_memory=False,
@@ -128,6 +571,7 @@ def load_gguf_state_dict(
         raise RuntimeError("GGUF support requires the 'gguf' package.")
     if pin_to_memory:
         raise Exception("Pinning to memory while loading GGUF files is not supported")
+    _gguf_cuda_kernels_enabled() # probes the llama.cpp CUDA kernels on first GGUF use, before any forward or graph capture
 
     import warnings
 
@@ -158,32 +602,36 @@ def load_gguf_state_dict(
             return gguf.GGMLQuantizationType.F32
         return None
 
-    reader = gguf.GGUFReader(file_path)
+    parsed = _gguf_get_index(file_path)
+    orig_shapes = dict(parsed.orig_shapes)
+    mmap_data = np.memmap(file_path, mode="r")
     if verboseLevel >= 2:
         try:
             from mmgp import safetensors2
             safetensors2.verboseLevel = verboseLevel
             tracker = safetensors2.MmapTracker(file_path)
-            tracker.register(reader.data, 0, 0, int(reader.data.nbytes))
+            tracker.register(mmap_data, 0, 0, int(mmap_data.nbytes))
         except Exception:
             tracker = None
-    tensor_names = [tensor.name for tensor in reader.tensors]
+    tensor_names = [tensor.name for tensor in parsed.tensor_infos]
     prefix = _gguf_resolve_prefix(tensor_names, ("model.diffusion_model.", "diffusion_model."))
 
     state_dict = {}
     qtype_counts = {}
-    for tensor in reader.tensors:
+    for tensor in parsed.tensor_infos:
         name = tensor.name
         if prefix and name.startswith(prefix):
             name = name[len(prefix):]
 
         with warnings.catch_warnings():
             warnings.filterwarnings("ignore", message="The given NumPy array is not writable")
-            torch_tensor = torch.from_numpy(tensor.data)
+            torch_tensor = torch.from_numpy(_gguf_open_tensor_numpy(mmap_data, parsed, tensor))
 
-        shape = _gguf_get_orig_shape(reader, tensor.name)
+        shape = orig_shapes.get(tensor.name, None)
         if shape is None:
-            shape = torch.Size(tuple(int(v) for v in reversed(tensor.shape)))
+            shape = torch.Size(tuple(int(v) for v in reversed(tensor.raw_shape)))
+        else:
+            shape = torch.Size(tuple(int(v) for v in shape))
         if tensor.tensor_type in (
             gguf.GGMLQuantizationType.F32,
             gguf.GGMLQuantizationType.F16,
@@ -210,7 +658,7 @@ def load_gguf_state_dict(
             new_sd.update(_filter_state_dict_basic(state_dict, one_filter, keep_prefixes))
         state_dict = new_sd
 
-    if state_dict:
+    if state_dict and not parsed.prism_metadata:
         for name, bias in list(state_dict.items()):
             if not name.endswith(".bias") or not torch.is_tensor(bias):
                 continue
@@ -275,6 +723,27 @@ class GGUFSourceTensor(torch.Tensor):
         detached.tensor_shape = getattr(self, "tensor_shape", detached.shape)
         return detached
 
+    @classmethod
+    def __torch_function__(cls, func, types, args=(), kwargs=None):
+        kwargs = kwargs or {}
+        if func is torch.split:
+            src = args[0]
+            dim = args[2] if len(args) > 2 else kwargs.get("dim", 0)
+            with torch._C.DisableTorchFunctionSubclass():
+                chunks = func(*args, **kwargs)
+            tensor_type = getattr(src, "tensor_type", None)
+            tensor_shape = getattr(src, "tensor_shape", None)
+            if tensor_type is None or tensor_shape is None:
+                return chunks
+            out = []
+            for chunk in chunks:
+                new_shape = list(tensor_shape)
+                if dim < len(new_shape) and src.shape[dim] == tensor_shape[dim]:
+                    new_shape[dim] = chunk.shape[dim]
+                out.append(GGUFSourceTensor.wrap(chunk, tensor_type=tensor_type, tensor_shape=tuple(new_shape)))
+            return tuple(out)
+        return super().__torch_function__(func, types, args, kwargs)
+
     def get_quantized_subtensors(self):
         return [("data", self)]
 
@@ -286,6 +755,39 @@ class GGUFSourceTensor(torch.Tensor):
         if data is None or data is self:
             return
         torch.utils.swap_tensors(self, data)
+
+
+def materialize_source_tensor(tensor: torch.Tensor) -> torch.Tensor:
+    if not isinstance(tensor, GGUFSourceTensor):
+        return tensor
+    with torch._C.DisableTorchFunctionSubclass():
+        plain = torch.empty_strided(
+            tuple(tensor.shape),
+            tuple(tensor.stride()),
+            dtype=tensor.dtype,
+            device=tensor.device,
+        )
+        plain.copy_(tensor)
+    return plain
+
+
+def materialize_module_source_tensors(module: torch.nn.Module) -> int:
+    converted = 0
+    for submodule in module.modules():
+        for name, param in list(submodule._parameters.items()):
+            if param is None or not isinstance(param, GGUFSourceTensor):
+                continue
+            submodule._parameters[name] = torch.nn.Parameter(
+                materialize_source_tensor(param),
+                requires_grad=param.requires_grad,
+            )
+            converted += 1
+        for name, buf in list(submodule._buffers.items()):
+            if buf is None or not isinstance(buf, GGUFSourceTensor):
+                continue
+            submodule._buffers[name] = materialize_source_tensor(buf)
+            converted += 1
+    return converted
 
 
 def _split_gguf_tensor(src, *, dim, split_sizes, context):
@@ -343,9 +845,115 @@ def _gguf_qtype_name(qtype_obj):
     return getattr(qtype_obj, "name", None) or str(qtype_obj)
 
 
+_LLAMACPP_SLICE_BYTES = 64 << 20  # scratch of the packed kernels for one slice of rows: q8_1 input and FP32 product
+GGUF_CUDA_CHUNKING = False  # Set True to opt into the new native CUDA row loop.
+
+# Switching implementations must select a fresh graph instead of replaying the old one.
+_cuda_graphs.register_key(lambda: GGUF_CUDA_CHUNKING)
+
+
+def _llamacpp_cuda_linear(module, raw, qtype_name, shape, input_tensor, bias, target_dtype):
+    # Legacy MMQ needs a Q8 input copy and an FP32 product. Bound that scratch with
+    # 128-row-aligned slices; newer kernels can process the same slices in one GPU loop.
+    out_features, in_features = shape
+    rows = input_tensor.numel() // in_features
+    step = max(128, _LLAMACPP_SLICE_BYTES // (4 * out_features + in_features * 9 // 8) // 128 * 128)
+    if rows < 2 * step or module._linear_mode() != "mmq":
+        return module.linear(raw, qtype_name, shape, input_tensor, bias, target_dtype)
+    step = -(-rows // (-(-rows // step) * 128)) * 128  # slices of even size
+    native_chunked = getattr(module, "linear_chunked", None) if GGUF_CUDA_CHUNKING else None
+    if callable(native_chunked):
+        out = native_chunked(raw, qtype_name, shape, input_tensor, bias, target_dtype, step)
+        if out is not None:
+            return out
+    # Older wheels and layouts outside the cooperative kernel keep bounded PyTorch slices.
+    x = input_tensor.reshape(rows, in_features)
+    out = torch.empty((rows, out_features), dtype=target_dtype, device=x.device)
+    for start in range(0, rows, step):
+        out[start:start + step].copy_(module.linear(raw, qtype_name, shape, x[start:start + step], None, torch.float32))
+    if bias is not None:
+        out.add_(bias.to(out.device, out.dtype))
+    return out.reshape(*input_tensor.shape[:-1], out_features)
+
+
+def _try_llamacpp_cuda_linear(weight_tensor, input_tensor, bias, target_dtype):
+    if not _gguf_cuda_kernels_enabled():
+        return None
+    if not torch.is_tensor(input_tensor) or input_tensor.device.type != "cuda":
+        return None
+    raw = getattr(weight_tensor, "_data", None)
+    if not torch.is_tensor(raw) or raw.device.type != "cuda" or not raw.is_contiguous():
+        return None
+    qtype_name = _gguf_qtype_name(getattr(weight_tensor, "_tensor_type", None))
+    gguf_llamacpp_cuda = _gguf_cuda_module()
+    if gguf_llamacpp_cuda is None or not gguf_llamacpp_cuda.may_support_linear_qtype_name(qtype_name):
+        return None
+    shape = tuple(getattr(weight_tensor, "_tensor_shape", weight_tensor.shape))
+    # Restored orig_shape rows can cross GGUF blocks. MMQ requires whole blocks
+    # per row; the fused tile decoder addresses the original flattened stream.
+    if shape[1] % _quantization_sizes(weight_tensor._tensor_type)[0] and gguf_llamacpp_cuda._linear_mode() == "mmq":
+        select_kernel = getattr(gguf_llamacpp_cuda, 'packed_row_kernel', None)
+        flat_linear = None if select_kernel is None else select_kernel(qtype_name, input_tensor.device.index, target_dtype)
+        if flat_linear is None:
+            return None
+        return flat_linear(input_tensor, raw, list(shape), qtype_name, _maybe_cast_bias(bias, target_dtype), target_dtype)
+    fast_out = _llamacpp_cuda_linear(gguf_llamacpp_cuda, raw, qtype_name, shape, input_tensor, bias, target_dtype)
+    _gguf_log_once(f"llamacpp_cuda_linear_active_{qtype_name}", f"[GGUF][llama.cpp CUDA] linear fast path active for {qtype_name}.")
+    return fast_out
+
+
+def _try_llamacpp_cuda_embedding(weight_tensor, index_tensor, target_dtype):
+    if not _gguf_cuda_kernels_enabled():
+        return None
+    if not torch.is_tensor(index_tensor) or index_tensor.device.type != "cuda":
+        return None
+    raw = getattr(weight_tensor, "_data", None)
+    if not torch.is_tensor(raw) or raw.device.type != "cuda" or not raw.is_contiguous():
+        return None
+    qtype_name = _gguf_qtype_name(getattr(weight_tensor, "_tensor_type", None))
+    gguf_llamacpp_cuda = _gguf_cuda_module()
+    if gguf_llamacpp_cuda is None or not gguf_llamacpp_cuda.may_support_embedding_qtype_name(qtype_name):
+        return None
+    fast_out = gguf_llamacpp_cuda.embedding(raw, qtype_name, tuple(getattr(weight_tensor, "_tensor_shape", weight_tensor.shape)), index_tensor, target_dtype)
+    _gguf_log_once(f"llamacpp_cuda_embedding_active_{qtype_name}", f"[GGUF][llama.cpp CUDA] embedding fast path active for {qtype_name}.")
+    return fast_out
+
+
+def _may_try_llamacpp_cuda_linear(weight_tensor, input_tensor):
+    if not _gguf_cuda_kernels_enabled():
+        return False
+    if not torch.is_tensor(input_tensor) or input_tensor.device.type != "cuda":
+        return False
+    raw = getattr(weight_tensor, "_data", None)
+    if not torch.is_tensor(raw) or raw.device.type != "cuda" or not raw.is_contiguous():
+        return False
+    qtype_name = _gguf_qtype_name(getattr(weight_tensor, "_tensor_type", None))
+    try:
+        gguf_llamacpp_cuda = _gguf_cuda_module()
+        return callable(getattr(gguf_llamacpp_cuda, "linear", None)) and gguf_llamacpp_cuda.may_support_linear_qtype_name(qtype_name)
+    except Exception:
+        return False
+
+
+def _may_try_llamacpp_cuda_embedding(weight_tensor, index_tensor):
+    if not _gguf_cuda_kernels_enabled():
+        return False
+    if not torch.is_tensor(index_tensor) or index_tensor.device.type != "cuda":
+        return False
+    raw = getattr(weight_tensor, "_data", None)
+    if not torch.is_tensor(raw) or raw.device.type != "cuda" or not raw.is_contiguous():
+        return False
+    qtype_name = _gguf_qtype_name(getattr(weight_tensor, "_tensor_type", None))
+    try:
+        gguf_llamacpp_cuda = _gguf_cuda_module()
+        return callable(getattr(gguf_llamacpp_cuda, "embedding", None)) and gguf_llamacpp_cuda.may_support_embedding_qtype_name(qtype_name)
+    except Exception:
+        return False
+
+
 def _guess_variant_from_filename(filename):
     base = os.path.basename(str(filename))
-    match = re.search(r"(?i)(?:^|[_-])(Q\d+_K|Q\d+_\d|Q\d+|IQ\d+_\w+)(?:$|[_.-])", base)
+    match = re.search(r"(?i)(?:^|[_-])(PTQ1_0|Q\d+_K|Q\d+_\d|Q\d+|IQ\d+_\w+)(?:$|[_.-])", base)
     if match:
         return match.group(1).upper()
     return None
@@ -355,11 +963,11 @@ def detect_gguf_quantization_variant(file_path, verboseLevel=1):
     if gguf is None:
         return None
     try:
-        reader = gguf.GGUFReader(file_path)
+        parsed = _gguf_get_index(file_path)
     except Exception:
         return None
     counts = {}
-    for tensor in reader.tensors:
+    for tensor in parsed.tensor_infos:
         qtype = getattr(tensor, "tensor_type", None)
         if qtype in (
             gguf.GGMLQuantizationType.F32,
@@ -428,14 +1036,32 @@ def _gguf_dequantize_tensor(raw, qtype_obj, oshape, dtype=None):
     if qtype_obj not in _DEQUANTIZE_FUNCTIONS:
         out = gguf.quants.dequantize(raw.cpu().numpy(), qtype_obj)
         out = torch.from_numpy(out)
-        return out.to(dtype) if dtype is not None else out
-    block_size, type_size = gguf.GGML_QUANT_SIZES[qtype_obj]
+        return out.to(device=raw.device, dtype=dtype).reshape(oshape)
+    block_size, type_size = _quantization_sizes(qtype_obj)
     dequantize_blocks = _DEQUANTIZE_FUNCTIONS[qtype_obj]
     rows = raw.reshape((-1, raw.shape[-1])).view(torch.uint8)
     n_blocks = rows.numel() // type_size
     blocks = rows.reshape((n_blocks, type_size))
-    blocks = dequantize_blocks(blocks, block_size, type_size, dtype)
-    return blocks.reshape(oshape)
+    if n_blocks > _GGUF_DEQUANTIZE_BLOCK_CHUNK:
+        output = torch.empty((n_blocks, block_size), device=raw.device, dtype=dtype or torch.float32)
+        for start in range(0, n_blocks, _GGUF_DEQUANTIZE_BLOCK_CHUNK):
+            end = min(start + _GGUF_DEQUANTIZE_BLOCK_CHUNK, n_blocks)
+            output[start:end].copy_(dequantize_blocks(blocks[start:end], block_size, type_size, torch.float32))
+        return output.reshape(oshape)
+    blocks = dequantize_blocks(blocks, block_size, type_size, torch.float32)
+    return blocks.reshape(oshape).to(dtype)
+
+
+def _dequantize_blocks_PTQ1_0(blocks, block_size, type_size, dtype):
+    # Prism's reference base-3 codec, including the four-trit tail bytes.
+    scale = blocks[:, 26:28].contiguous().view(torch.float16).to(dtype)
+    pieces = []
+    for offset, width, count in ((0, 16, 5), (16, 8, 5), (24, 2, 4)):
+        packed = blocks[:, offset:offset + width].to(torch.int32)
+        for n in range(count):
+            trit = (((packed * (3 ** n)) & 255) * 3 >> 8) - 1
+            pieces.append(trit.to(dtype) * scale)
+    return torch.cat(pieces, dim=1)
 
 
 def _maybe_cast_bias(bias, target_dtype):
@@ -627,8 +1253,114 @@ def _dequantize_blocks_Q2_K(blocks, block_size, type_size, dtype=None):
     return qs.reshape((n_blocks, -1))
 
 
+def _iq_grid(quant, blocks):
+    quant.init_grid()
+    # gguf owns the immutable CPU table for the lifetime of captured H2D copies.
+    return torch.from_numpy(quant.grid).to(device=blocks.device, non_blocking=True).reshape(quant.grid_shape)
+
+
+def _iq_signs(indices):
+    bits = (indices.unsqueeze(-1) >> torch.arange(8, device=indices.device)) & 1
+    bits[..., 7] = bits[..., :7].sum(-1) & 1
+    return 1 - 2 * bits.float()
+
+
+def _dequantize_blocks_IQ2_XXS(blocks, block_size, type_size, dtype=None):
+    n = blocks.shape[0]
+    d, qs = _split_block_dims(blocks, 2)
+    words = _to_uint32(qs.reshape(-1, 4)).reshape(n, 8, 2)
+    db = (d.view(torch.float16).float() * (.5 + ((words[..., 1] >> 28) & 15).float()) * .25).reshape(n, 8, 1, 1)
+    signs = _iq_signs((words[..., 1, None] >> (torch.arange(4, device=blocks.device) * 7)) & 127)
+    indices = qs.reshape(n, 8, 8)[..., :4].long()
+    values = _iq_grid(gguf.quants.IQ2_XXS, blocks).index_select(0, indices.reshape(-1)).reshape(n, 8, 4, 8)
+    return (db * values * signs).reshape(n, block_size).to(dtype)
+
+
+def _dequantize_blocks_IQ2_XS(blocks, block_size, type_size, dtype=None):
+    n = blocks.shape[0]
+    d, qs, scales = _split_block_dims(blocks, 2, 64)
+    words = _to_uint16(qs.reshape(-1, 2)).reshape(n, 32)
+    scales = ((scales.unsqueeze(-1) >> (torch.arange(2, device=blocks.device) * 4)) & 15).reshape(n, 16)
+    db = (d.view(torch.float16).float() * (.5 + scales.float()) * .25).reshape(n, 16, 1, 1)
+    signs = _iq_signs(words >> 9).reshape(n, 16, 2, 8)
+    values = _iq_grid(gguf.quants.IQ2_XS, blocks).index_select(0, (words & 511).reshape(-1).long()).reshape(n, 16, 2, 8)
+    return (db * values * signs).reshape(n, block_size).to(dtype)
+
+
+def _dequantize_blocks_IQ2_S(blocks, block_size, type_size, dtype=None):
+    n = blocks.shape[0]
+    d, qs, signs, qh, scales = _split_block_dims(blocks, 2, 32, 32, 8)
+    shifts = torch.arange(8, device=blocks.device, dtype=torch.uint8)
+    scales = (scales.unsqueeze(-1) >> (shifts[:2] * 4) & 15).reshape(n, 16)
+    db = (d.view(torch.float16).float() * (scales.float() + .5) * .25).reshape(n, 16, 1, 1)
+    signs = (1 - 2 * ((signs.unsqueeze(-1) >> shifts) & 1).float()).reshape(n, 16, 2, 8)
+    qh = ((qh.unsqueeze(-1) >> (shifts[:4] * 2)) & 3).reshape(n, 32).int()
+    indices = qs.int() | (qh << 8)
+    values = _iq_grid(gguf.quants.IQ2_S, blocks).index_select(0, indices.reshape(-1).long()).reshape(n, 16, 2, 8)
+    return (db * values * signs).reshape(n, block_size).to(dtype)
+
+
+def _dequantize_blocks_IQ3_XXS(blocks, block_size, type_size, dtype=None):
+    n = blocks.shape[0]
+    d, qs, scales = _split_block_dims(blocks, 2, 64)
+    words = _to_uint32(scales.reshape(-1, 4)).reshape(n, 8)
+    db = (d.view(torch.float16).float() * (.5 + ((words >> 28) & 15).float()) * .5).reshape(n, 8, 1, 1)
+    signs = _iq_signs((words.unsqueeze(-1) >> (torch.arange(4, device=blocks.device) * 7)) & 127)
+    values = _iq_grid(gguf.quants.IQ3_XXS, blocks).index_select(0, qs.reshape(-1).long()).reshape(n, 8, 4, 8)
+    return (db * values * signs).reshape(n, block_size).to(dtype)
+
+
+def _dequantize_blocks_IQ3_S(blocks, block_size, type_size, dtype=None):
+    n = blocks.shape[0]
+    d, qs, qh, signs, scales = _split_block_dims(blocks, 2, 64, 8, 32)
+    shifts = torch.arange(8, device=blocks.device, dtype=torch.uint8)
+    scales = (scales.unsqueeze(-1) >> (shifts[:2] * 4) & 15).reshape(n, 8)
+    db = (d.view(torch.float16).float() * (1 + 2 * scales)).reshape(n, 8, 1, 1)
+    signs = (1 - 2 * ((signs.unsqueeze(-1) >> shifts) & 1).float()).reshape(n, 8, 4, 8)
+    qh = ((qh.unsqueeze(-1) >> shifts) & 1).reshape(n, 64).int()
+    indices = qs.int() | (qh << 8)
+    values = _iq_grid(gguf.quants.IQ3_S, blocks).index_select(0, indices.reshape(-1).long()).reshape(n, 8, 4, 8)
+    return (db * values * signs).reshape(n, block_size).to(dtype)
+
+
+def _dequantize_blocks_IQ1_S(blocks, block_size, type_size, dtype=None):
+    n = blocks.shape[0]
+    d, qs, qh = _split_block_dims(blocks, 2, 32)
+    words = _to_uint16(qh.reshape(-1, 2)).reshape(n, 8)
+    dl = (d.view(torch.float16).float() * (2 * ((words >> 12) & 7) + 1)).reshape(n, 8, 1, 1)
+    delta = torch.where((words & 32768) == 0, .125, -.125).reshape(n, 8, 1, 1)
+    high = ((words.unsqueeze(-1) >> (torch.arange(4, device=blocks.device) * 3)) & 7).reshape(n, 32)
+    indices = qs.int() | (high << 8)
+    values = _iq_grid(gguf.quants.IQ1_S, blocks).index_select(0, indices.reshape(-1).long()).reshape(n, 8, 4, 8)
+    return (dl * (values + delta)).reshape(n, block_size).to(dtype)
+
+
+def _iq4_values(indices):
+    values = _IQ4_VALUES.to(device=indices.device, non_blocking=True)
+    return values[indices.long()]
+
+
+def _dequantize_blocks_IQ4_NL(blocks, block_size, type_size, dtype=None):
+    n = blocks.shape[0]
+    d, qs = _split_block_dims(blocks, 2)
+    qs = (qs.reshape(n, 1, 16) >> (torch.arange(2, device=blocks.device) * 4).reshape(1, 2, 1)) & 15
+    return (d.view(torch.float16).float() * _iq4_values(qs).reshape(n, 32)).to(dtype)
+
+
+def _dequantize_blocks_IQ4_XS(blocks, block_size, type_size, dtype=None):
+    n = blocks.shape[0]
+    d, scales_h, scales_l, qs = _split_block_dims(blocks, 2, 2, 4)
+    low = ((scales_l.unsqueeze(-1) >> (torch.arange(2, device=blocks.device) * 4)) & 15).reshape(n, 8)
+    high = (_to_uint16(scales_h) >> (torch.arange(8, device=blocks.device) * 2)) & 3
+    dl = (d.view(torch.float16).float() * ((low | (high << 4)) - 32)).reshape(n, 8, 1)
+    qs = (qs.reshape(n, 8, 1, 16) >> (torch.arange(2, device=blocks.device) * 4).reshape(1, 1, 2, 1)) & 15
+    return (dl * _iq4_values(qs).reshape(n, 8, 32)).reshape(n, block_size).to(dtype)
+
+
 if gguf is not None:
+    _IQ4_VALUES = torch.tensor(gguf.quants.IQ4_NL.kvalues, device="cpu", dtype=torch.float32)
     _DEQUANTIZE_FUNCTIONS = {
+        PrismQuantizationType.PTQ1_0: _dequantize_blocks_PTQ1_0,
         gguf.GGMLQuantizationType.Q8_0: _dequantize_blocks_Q8_0,
         gguf.GGMLQuantizationType.Q5_1: _dequantize_blocks_Q5_1,
         gguf.GGMLQuantizationType.Q5_0: _dequantize_blocks_Q5_0,
@@ -639,6 +1371,14 @@ if gguf is not None:
         gguf.GGMLQuantizationType.Q4_K: _dequantize_blocks_Q4_K,
         gguf.GGMLQuantizationType.Q3_K: _dequantize_blocks_Q3_K,
         gguf.GGMLQuantizationType.Q2_K: _dequantize_blocks_Q2_K,
+        gguf.GGMLQuantizationType.IQ2_S: _dequantize_blocks_IQ2_S,
+        gguf.GGMLQuantizationType.IQ3_S: _dequantize_blocks_IQ3_S,
+        gguf.GGMLQuantizationType.IQ1_S: _dequantize_blocks_IQ1_S,
+        gguf.GGMLQuantizationType.IQ2_XS: _dequantize_blocks_IQ2_XS,
+        gguf.GGMLQuantizationType.IQ2_XXS: _dequantize_blocks_IQ2_XXS,
+        gguf.GGMLQuantizationType.IQ3_XXS: _dequantize_blocks_IQ3_XXS,
+        gguf.GGMLQuantizationType.IQ4_NL: _dequantize_blocks_IQ4_NL,
+        gguf.GGMLQuantizationType.IQ4_XS: _dequantize_blocks_IQ4_XS,
     }
 else:
     _DEQUANTIZE_FUNCTIONS = {}
@@ -716,6 +1456,38 @@ class GGUFWeightTensor(QTensor):
         raw = self._data if self._data.device == device else self._data.to(device)
         return _gguf_dequantize_tensor(raw, self._tensor_type, self._tensor_shape, dtype=dtype)
 
+    def embedding(self, input, dtype=None):
+        if dtype is None:
+            dtype = self.dtype
+        if len(self._tensor_shape) != 2:
+            return None
+
+        num_embeddings, embedding_dim = self._tensor_shape
+        _gguf_log_once(f"torch_embedding_{self._tensor_type.name}", f"[GGUF] embedding backend=PyTorch packed-row dequantization for {self._tensor_type.name}.")
+        raw = self._data.reshape(num_embeddings, -1)
+        flat_input = input.reshape(-1)
+        if flat_input.numel() == 0:
+            return torch.empty((*input.shape, embedding_dim), dtype=dtype, device=input.device)
+
+        # GGUF blocks are row-aligned, so gather each requested packed row before dequantizing it.
+        source_input = flat_input if flat_input.device == raw.device else flat_input.to(raw.device)
+        raw_rows = raw.index_select(0, source_input)
+        del source_input
+
+        if raw_rows.device != input.device:
+            raw_rows = raw_rows.to(input.device)
+        dense_rows = _gguf_dequantize_tensor(
+            raw_rows,
+            self._tensor_type,
+            (flat_input.numel(), embedding_dim),
+            dtype=dtype,
+        )
+        del raw_rows
+        if dense_rows.device != input.device:
+            dense_rows = dense_rows.to(input.device)
+
+        return dense_rows.reshape(*input.shape, embedding_dim)
+
     def linear(self, input, bias=None):
         if torch.is_tensor(input):
             target_dtype = _resolve_default_dtype(self._gguf_default_dtype, fallback=input.dtype)
@@ -723,6 +1495,14 @@ class GGUFWeightTensor(QTensor):
         else:
             target_dtype = _resolve_default_dtype(self._gguf_default_dtype, fallback=self.dtype)
             target_device = self.device
+        if self._tensor_type == PrismQuantizationType.PTQ1_0 and target_device.type == "cuda":
+            from .prism import ptq_linear
+            return ptq_linear(input, self._data, list(self._tensor_shape), bias, target_dtype)
+        if _may_try_llamacpp_cuda_linear(self, input):
+            fast_out = _try_llamacpp_cuda_linear(self, input, bias, target_dtype)
+            if fast_out is not None:
+                return fast_out
+        _gguf_log_once(f"torch_linear_{self._tensor_type.name}", f"[GGUF] linear backend=PyTorch dense weight materialization for {self._tensor_type.name}.")
         weight = self.dequantize(dtype=target_dtype, device=target_device)
         if torch.is_tensor(input) and input.dtype != weight.dtype:
             input = input.to(weight.dtype)
@@ -730,15 +1510,22 @@ class GGUFWeightTensor(QTensor):
         return torch.nn.functional.linear(input, weight, bias)
 
     def get_quantized_subtensors(self):
-        return [("data", self._data)]
+        raw = GGUFSourceTensor.wrap(self._data, tensor_type=self._tensor_type, tensor_shape=self._tensor_shape)
+        return [("raw_tensor", raw)]
 
     def set_quantized_subtensors(self, sub_tensors):
         if isinstance(sub_tensors, dict):
             sub_map = sub_tensors
         else:
             sub_map = {name: tensor for name, tensor in sub_tensors}
-        data = sub_map.get("data", None)
+        data = sub_map.get("raw_tensor", sub_map.get("data", None))
         if data is not None:
+            tensor_type = getattr(data, "tensor_type", None)
+            if tensor_type is not None:
+                self._tensor_type = tensor_type
+            tensor_shape = getattr(data, "tensor_shape", None)
+            if tensor_shape is not None:
+                self._tensor_shape = torch.Size(tensor_shape)
             old_data = self._data
             if torch.is_tensor(old_data):
                 try:
@@ -779,7 +1566,7 @@ class GGUFWeightTensor(QTensor):
         tensor_shape = ast.literal_eval(meta.get("tensor_shape", str(list(size))))
         tensor_type = None
         if gguf is not None and meta.get("tensor_type"):
-            tensor_type = getattr(gguf.GGMLQuantizationType, meta["tensor_type"], None)
+            tensor_type = getattr(PrismQuantizationType, meta["tensor_type"], None) or getattr(gguf.GGMLQuantizationType, meta["tensor_type"], None)
         return GGUFWeightTensor(
             qtype=qtype,
             axis=axis,
@@ -845,6 +1632,81 @@ class GGUFWeightTensor(QTensor):
         return _gguf_qfallback(op, *args, **(kwargs or {}))
 
 
+class _GGUFRowProjection:
+    @staticmethod
+    def supports(module, x):
+        weight = getattr(module, "weight", None)
+        return (isinstance(weight, GGUFWeightTensor) and not is_fake(x) and len(weight._tensor_shape) == 2
+                and weight.shape[1] % _quantization_sizes(weight._tensor_type)[0] == 0
+                and not (getattr(module, "_use_optimized_kernels", False) and x.shape[0] <= 8)
+                and not (getattr(module, "_prism_decode_enabled", False) and x.shape[0] == 1))
+
+    @staticmethod
+    def key(module):
+        transform = getattr(module, "prism_transform", None)
+        return ("prism_rows", transform) if transform is not None else None
+
+    @staticmethod
+    def prepare(module, x):
+        return module.prism_transform(x)
+
+    @staticmethod
+    def rows(module, x, start, stop):
+        source = module.weight
+        k = source.shape[1]
+        raw = source._data.reshape(source.shape[0], -1)[start:stop].reshape(-1)
+        weight = GGUFWeightTensor.create(raw, (stop - start, k), (k, 1), source.dtype,
+                                         tensor_type=source._tensor_type, tensor_shape=(stop - start, k))
+        return weight.linear(x, None if module.bias is None else module.bias[start:stop])
+
+
+from mmgp import offload
+
+_GGUF_ROW_PROJECTION = _GGUFRowProjection()
+offload.register_row_projection(_GGUF_ROW_PROJECTION)
+
+
+class GGUFFirstRowsLinear(torch.nn.Module):
+    """Zero-copy linear view over a contiguous prefix of GGUF weight rows."""
+
+    def __init__(self, source: torch.nn.Module, row_count: int):
+        super().__init__()
+        self.register_parameter("weight", source.weight)
+        self.row_count = int(row_count)
+        object.__setattr__(self, "_cached_raw", None)
+        object.__setattr__(self, "_cached_weight", None)
+
+    def clear_cache(self) -> None:
+        object.__setattr__(self, "_cached_raw", None)
+        object.__setattr__(self, "_cached_weight", None)
+
+    def forward(self, input: torch.Tensor) -> torch.Tensor:
+        source_weight = self.weight
+        if not isinstance(source_weight, GGUFWeightTensor):
+            raise TypeError(f"GGUFFirstRowsLinear requires GGUFWeightTensor, got {type(source_weight).__name__}.")
+        full_rows, in_features = map(int, source_weight._tensor_shape)
+        if not 0 < self.row_count <= full_rows or source_weight._data.numel() % full_rows:
+            raise RuntimeError(f"Cannot make a {self.row_count}-row view of GGUF weight {tuple(source_weight._tensor_shape)}.")
+        source_raw = source_weight._data
+        if self._cached_raw is not source_raw:
+            row_bytes = source_raw.numel() // full_rows
+            raw = source_raw.reshape(-1)[:self.row_count * row_bytes]
+            weight = GGUFWeightTensor.create(raw, (self.row_count, in_features), (in_features, 1), source_weight.dtype, tensor_type=source_weight._tensor_type, tensor_shape=(self.row_count, in_features))
+            object.__setattr__(self, "_cached_raw", source_raw)
+            object.__setattr__(self, "_cached_weight", weight)
+        return self._cached_weight.linear(input)
+
+
+@torch.library.custom_op("wangp_gguf::linear_fused", mutates_args=())
+def linear_fused(x: torch.Tensor, raw: torch.Tensor, qtype: str, shape: List[int], bias: Optional[torch.Tensor], dtype: torch.dtype, silu_mul: bool) -> torch.Tensor:
+    return _gguf_cuda_module().linear(raw, qtype, shape, x, bias, dtype, fused_output=True, silu_mul=silu_mul)
+
+
+@linear_fused.register_fake
+def _linear_fake(x, raw, qtype, shape, bias, dtype, silu_mul):
+    return x.new_empty((*x.shape[:-1], shape[0]), dtype=dtype)
+
+
 class QLinearGGUF(QModuleMixin, torch.nn.Linear):
     def __init__(
         self,
@@ -900,8 +1762,29 @@ class QLinearGGUF(QModuleMixin, torch.nn.Linear):
             return self.weight
         return super().qweight
 
-    def forward(self, input: torch.Tensor) -> torch.Tensor:
+    def forward(self, input: torch.Tensor | list[torch.Tensor]) -> torch.Tensor:
+        # The existing list handoff carries pre-activation FFN input. Keep the
+        # normal module call so MMGP loads this projection before using weights.
+        silu_mul = isinstance(input, list)
+        if silu_mul:
+            handoff = input
+            input = handoff[0]
+            handoff.clear()
         qweight = self.qweight
+        optimized = getattr(self, "_use_optimized_kernels", False)
+        # Decode and short speculative batches (up to 8 rows): typed outputs and
+        # fused SiLU-multiply avoid separate conversion and activation kernels
+        # (bit-identical results). Prefill keeps the established kernels.
+        if optimized and input.numel() <= 8 * input.shape[-1] and input.is_cuda and torch.version.hip is None and isinstance(qweight, GGUFWeightTensor):
+            native = _gguf_cuda_module()
+            supports = getattr(native, "supports_linear_fusions", None)
+            if (callable(supports) and qweight.shape[1] % _quantization_sizes(qweight._tensor_type)[0] == 0
+                    and supports(qweight._tensor_type.name, input.numel() // input.shape[-1], input.device.index)):
+                dtype = _resolve_default_dtype(qweight._gguf_default_dtype, fallback=input.dtype)
+                return linear_fused(input, qweight._data, qweight._tensor_type.name, list(qweight._tensor_shape), self.bias, dtype, silu_mul)
+        if silu_mul:
+            from shared.llm_engines.nanovllm.layers.activation import silu_mul as apply_silu_mul
+            input = apply_silu_mul(input, use_triton=optimized)
         if isinstance(qweight, GGUFWeightTensor):
             return qweight.linear(input, bias=self.bias)
         return torch.nn.functional.linear(input, qweight, bias=self.bias)
@@ -968,6 +1851,286 @@ class QLinearGGUF(QModuleMixin, torch.nn.Linear):
         return
 
 
+@register_qmodule(torch.nn.Conv1d)
+class QConv1dGGUF(QModuleMixin, torch.nn.Conv1d):
+    def __init__(
+        self,
+        in_channels,
+        out_channels,
+        kernel_size,
+        stride=1,
+        padding=0,
+        dilation=1,
+        groups=1,
+        bias=True,
+        padding_mode="zeros",
+        device=None,
+        dtype=None,
+        weights=None,
+        activations=None,
+        optimizer=None,
+        quantize_input=True,
+    ):
+        super().__init__(
+            in_channels,
+            out_channels,
+            kernel_size,
+            stride=stride,
+            padding=padding,
+            dilation=dilation,
+            groups=groups,
+            bias=bias,
+            padding_mode=padding_mode,
+            device=device,
+            dtype=dtype,
+            weights=weights,
+            activations=activations,
+            optimizer=optimizer,
+            quantize_input=quantize_input,
+        )
+        self._gguf_default_dtype = dtype
+
+    @classmethod
+    def qcreate(cls, module, weights, activations=None, optimizer=None, device=None):
+        if torch.is_tensor(module.weight) and module.weight.dtype.is_floating_point:
+            weight_dtype = module.weight.dtype
+        elif torch.is_tensor(getattr(module, "bias", None)) and module.bias.dtype.is_floating_point:
+            weight_dtype = module.bias.dtype
+        else:
+            weight_dtype = torch.float16
+        return cls(
+            module.in_channels,
+            module.out_channels,
+            module.kernel_size,
+            stride=module.stride,
+            padding=module.padding,
+            dilation=module.dilation,
+            groups=module.groups,
+            bias=module.bias is not None,
+            padding_mode=module.padding_mode,
+            device=device,
+            dtype=weight_dtype,
+            weights=weights,
+            activations=activations,
+            optimizer=optimizer,
+            quantize_input=True,
+        )
+
+    def set_default_dtype(self, dtype):
+        self._gguf_default_dtype = dtype
+
+    @property
+    def qweight(self):
+        if self.weight_qtype == _GGUF_QTYPE:
+            return self.weight
+        return super().qweight
+
+    def forward(self, input: torch.Tensor) -> torch.Tensor:
+        qweight = self.qweight
+        if isinstance(qweight, GGUFWeightTensor):
+            target_dtype = _resolve_default_dtype(self._gguf_default_dtype, fallback=input.dtype)
+            weight = qweight.dequantize(dtype=target_dtype, device=input.device)
+            bias = _maybe_cast_bias(self.bias, weight.dtype)
+            if input.dtype != weight.dtype:
+                input = input.to(weight.dtype)
+            return torch.nn.functional.conv1d(
+                input,
+                weight,
+                bias=bias,
+                stride=self.stride,
+                padding=self.padding,
+                dilation=self.dilation,
+                groups=self.groups,
+            )
+        return torch.nn.functional.conv1d(
+            input,
+            qweight,
+            bias=self.bias,
+            stride=self.stride,
+            padding=self.padding,
+            dilation=self.dilation,
+            groups=self.groups,
+        )
+
+    def _load_from_state_dict(
+        self, state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs
+    ):
+        if self.weight_qtype != _GGUF_QTYPE:
+            return super()._load_from_state_dict(
+                state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs
+            )
+
+        weight_key = prefix + "weight"
+        bias_key = prefix + "bias"
+        input_scale_key = prefix + "input_scale"
+        output_scale_key = prefix + "output_scale"
+
+        weight_raw = state_dict.pop(weight_key, None)
+        bias = state_dict.pop(bias_key, None)
+        input_scale = state_dict.pop(input_scale_key, None)
+        output_scale = state_dict.pop(output_scale_key, None)
+
+        if weight_raw is None:
+            missing_keys.append(weight_key)
+
+        target_dtype = _resolve_default_dtype(self._gguf_default_dtype, fallback=self.weight.dtype)
+        if weight_raw is not None:
+            gguf_weight = GGUFWeightTensor.create(
+                raw_tensor=weight_raw,
+                size=self.weight.size(),
+                stride=self.weight.stride(),
+                dtype=target_dtype,
+                device=weight_raw.device,
+                requires_grad=False,
+            )
+            self.weight = torch.nn.Parameter(gguf_weight, requires_grad=False)
+
+        if bias is not None:
+            self.bias = torch.nn.Parameter(bias, requires_grad=False)
+
+        if torch.is_tensor(weight_raw):
+            scale_device = weight_raw.device
+        elif torch.is_tensor(self.weight):
+            scale_device = self.weight.device
+        elif torch.is_tensor(bias):
+            scale_device = bias.device
+        else:
+            scale_device = torch.device("cpu")
+
+        if input_scale is not None:
+            self.input_scale = input_scale.to(scale_device)
+        elif not hasattr(self, "input_scale") or self.input_scale.is_meta:
+            scale_dtype = self.input_scale.dtype if hasattr(self, "input_scale") else torch.float32
+            self.input_scale = torch.ones((), dtype=scale_dtype, device=scale_device)
+
+        if output_scale is not None:
+            self.output_scale = output_scale.to(scale_device)
+        elif not hasattr(self, "output_scale") or self.output_scale.is_meta:
+            scale_dtype = self.output_scale.dtype if hasattr(self, "output_scale") else torch.float32
+            self.output_scale = torch.ones((), dtype=scale_dtype, device=scale_device)
+
+        return
+
+
+@register_qmodule(torch.nn.Embedding)
+class QEmbedding(BaseQEmbedding):
+    def __init__(
+        self,
+        num_embeddings,
+        embedding_dim,
+        padding_idx=None,
+        max_norm=None,
+        norm_type=2.0,
+        scale_grad_by_freq=False,
+        sparse=False,
+        device=None,
+        dtype=None,
+        weights=None,
+        activations=None,
+        optimizer=None,
+        quantize_input=True,
+    ):
+        super().__init__(
+            num_embeddings,
+            embedding_dim,
+            padding_idx=padding_idx,
+            max_norm=max_norm,
+            norm_type=norm_type,
+            scale_grad_by_freq=scale_grad_by_freq,
+            sparse=sparse,
+            device=device,
+            dtype=dtype,
+            weights=weights,
+            activations=activations,
+            optimizer=optimizer,
+            quantize_input=quantize_input,
+        )
+        self._gguf_default_dtype = dtype
+
+    @classmethod
+    def from_module(cls, module, weights=None, activations=None, optimizer=None):
+        qmodule = super().from_module(module, weights, activations, optimizer)
+        if "embed_scale" in module._buffers:
+            qmodule.register_buffer("embed_scale", module._buffers["embed_scale"], persistent="embed_scale" not in module._non_persistent_buffers_set)
+        elif hasattr(module, "embed_scale"):
+            qmodule.embed_scale = module.embed_scale
+        return qmodule
+
+    def set_default_dtype(self, dtype):
+        self._gguf_default_dtype = dtype
+
+    @property
+    def qweight(self):
+        if self.weight_qtype == _GGUF_QTYPE:
+            return self.weight
+        return super().qweight
+
+    def _apply_embed_scale(self, output):
+        embed_scale = getattr(self, "embed_scale", None)
+        if torch.is_tensor(embed_scale):
+            embed_scale = embed_scale.to(device=output.device, dtype=output.dtype)
+        return output if embed_scale is None else output * embed_scale
+
+    def forward(self, input: torch.Tensor) -> torch.Tensor:
+        qweight = self.qweight
+        if isinstance(qweight, GGUFWeightTensor):
+            target_dtype = _resolve_default_dtype(self._gguf_default_dtype, fallback=torch.float16)
+            if self.max_norm is None and not self.scale_grad_by_freq and not self.sparse:
+                if _may_try_llamacpp_cuda_embedding(qweight, input):
+                    fast_out = _try_llamacpp_cuda_embedding(qweight, input, target_dtype)
+                    if fast_out is not None:
+                        return self._apply_embed_scale(fast_out)
+                output = qweight.embedding(input, dtype=target_dtype)
+                if output is not None:
+                    return self._apply_embed_scale(output)
+            weight = qweight.dequantize(dtype=target_dtype, device=input.device)
+            output = torch.nn.functional.embedding(
+                input,
+                weight,
+                self.padding_idx,
+                self.max_norm,
+                self.norm_type,
+                self.scale_grad_by_freq,
+                self.sparse,
+            )
+            return self._apply_embed_scale(output)
+        return super().forward(input)
+
+    def _load_from_state_dict(
+        self, state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs
+    ):
+        if self.weight_qtype != _GGUF_QTYPE:
+            return super()._load_from_state_dict(
+                state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs
+            )
+
+        weight_key = prefix + "weight"
+        weight_raw = state_dict.pop(weight_key, None)
+        if weight_raw is None:
+            missing_keys.append(weight_key)
+            return
+
+        target_dtype = _resolve_default_dtype(self._gguf_default_dtype, fallback=self.weight.dtype)
+        gguf_weight = GGUFWeightTensor.create(
+            raw_tensor=weight_raw,
+            size=self.weight.size(),
+            stride=self.weight.stride(),
+            dtype=target_dtype,
+            device=weight_raw.device,
+            requires_grad=False,
+        )
+        self.weight = torch.nn.Parameter(gguf_weight, requires_grad=False)
+        scale_device = weight_raw.device if torch.is_tensor(weight_raw) else torch.device("cpu")
+        if not hasattr(self, "input_scale") or self.input_scale is None or self.input_scale.is_meta:
+            self.input_scale = torch.ones((), dtype=torch.float32, device=scale_device)
+        else:
+            self.input_scale = self.input_scale.to(scale_device)
+        if not hasattr(self, "output_scale") or self.output_scale is None or self.output_scale.is_meta:
+            self.output_scale = torch.ones((), dtype=torch.float32, device=scale_device)
+        else:
+            self.output_scale = self.output_scale.to(scale_device)
+
+
 def _collect_gguf_specs(state_dict):
     specs = []
     for key, tensor in state_dict.items():
@@ -1002,7 +2165,21 @@ def convert_to_quanto(state_dict, default_dtype, verboseLevel=1, detection=None)
     return {"state_dict": state_dict, "quant_map": quant_map}
 
 
+def _prepare_runtime_buffers(device):
+    module = _gguf_cuda_module()
+    if module is not None:
+        module.prepare_runtime_buffers(device)
+
+
+def _release_runtime_buffers():
+    if _GGUF_CUDA_MODULE is not None:
+        _GGUF_CUDA_MODULE.release_runtime_buffers()
+
+
 def apply_pre_quantization(model, state_dict, quantization_map, default_dtype=None, verboseLevel=1):
+    if model is not None and any(info.get("weights") == _GGUF_QTYPE_NAME for info in (quantization_map or {}).values()):
+        from mmgp import runtime
+        runtime.register_resource(model, _prepare_runtime_buffers, _release_runtime_buffers)
     if default_dtype is None or model is None or not quantization_map:
         return quantization_map or {}, []
     _set_default_dtype_from_loader(default_dtype)

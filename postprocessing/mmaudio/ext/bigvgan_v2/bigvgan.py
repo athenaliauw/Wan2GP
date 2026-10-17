@@ -1,3 +1,5 @@
+# Modified for WanGP.
+from shared.utils.media_control import inference_checkpoint
 # Copyright (c) 2024 NVIDIA CORPORATION.
 #   Licensed under the MIT license.
 
@@ -112,6 +114,7 @@ class AMPBlock1(torch.nn.Module):
     def forward(self, x):
         acts1, acts2 = self.activations[::2], self.activations[1::2]
         for c1, c2, a1, a2 in zip(self.convs1, self.convs2, acts1, acts2):
+            inference_checkpoint()
             xt = a1(x)
             xt = c1(xt)
             xt = a2(xt)
@@ -196,6 +199,7 @@ class AMPBlock2(torch.nn.Module):
 
     def forward(self, x):
         for c, a in zip(self.convs, self.activations):
+            inference_checkpoint()
             xt = a(x)
             xt = c(xt)
             x = xt + x
@@ -309,12 +313,15 @@ class BigVGAN(
         x = self.conv_pre(x)
 
         for i in range(self.num_upsamples):
+            inference_checkpoint()
             # Upsampling
             for i_up in range(len(self.ups[i])):
+                inference_checkpoint()
                 x = self.ups[i][i_up](x)
             # AMP blocks
             xs = None
             for j in range(self.num_kernels):
+                inference_checkpoint()
                 if xs is None:
                     xs = self.resblocks[i * self.num_kernels + j](x)
                 else:
@@ -345,6 +352,12 @@ class BigVGAN(
         except ValueError:
             print("[INFO] Model already removed weight norm. Skipping!")
             pass
+
+    @classmethod
+    def from_config(cls, config: Dict):
+        config_data = dict(config)
+        use_cuda_kernel = config_data.pop("use_cuda_kernel", False)
+        return cls(AttrDict(config_data), use_cuda_kernel=use_cuda_kernel)
 
     # Additional methods for huggingface_hub support
     def _save_pretrained(self, save_directory: Path) -> None:

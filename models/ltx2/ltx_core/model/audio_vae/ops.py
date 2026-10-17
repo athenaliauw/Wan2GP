@@ -12,24 +12,28 @@ class AudioProcessor(nn.Module):
         mel_bins: int,
         mel_hop_length: int,
         n_fft: int,
+        device: torch.device,
     ) -> None:
         super().__init__()
         self.sample_rate = sample_rate
-        self.mel_transform = torchaudio.transforms.MelSpectrogram(
-            sample_rate=sample_rate,
-            n_fft=n_fft,
-            win_length=n_fft,
-            hop_length=mel_hop_length,
-            f_min=0.0,
-            f_max=sample_rate / 2.0,
-            n_mels=mel_bins,
-            window_fn=torch.hann_window,
-            center=True,
-            pad_mode="reflect",
-            power=1.0,
-            mel_scale="slaney",
-            norm="slaney",
-        )
+        self.n_fft = n_fft
+        # torchaudio computes the window and mel filters on the default device: on the generation device, as for callers that relied on it
+        with torch.device(device):
+            self.mel_transform = torchaudio.transforms.MelSpectrogram(
+                sample_rate=sample_rate,
+                n_fft=n_fft,
+                win_length=n_fft,
+                hop_length=mel_hop_length,
+                f_min=0.0,
+                f_max=sample_rate / 2.0,
+                n_mels=mel_bins,
+                window_fn=torch.hann_window,
+                center=True,
+                pad_mode="reflect",
+                power=1.0,
+                mel_scale="slaney",
+                norm="slaney",
+            )
 
     def resample_waveform(
         self,
@@ -42,6 +46,18 @@ class AudioProcessor(nn.Module):
             return waveform
         resampled = torchaudio.functional.resample(waveform, source_rate, target_rate)
         return resampled.to(device=waveform.device, dtype=waveform.dtype)
+
+    def waveform_too_short_for_mel(
+        self,
+        waveform: torch.Tensor,
+        waveform_sample_rate: int,
+    ) -> bool:
+        source_rate = int(waveform_sample_rate or 0)
+        if waveform.shape[-1] <= 0:
+            return True
+        if source_rate <= 0:
+            return False
+        return waveform.shape[-1] * int(self.sample_rate) <= (int(self.n_fft) // 2) * source_rate
 
     def waveform_to_mel(
         self,

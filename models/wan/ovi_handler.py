@@ -1,4 +1,6 @@
-import os
+# Copyright (c) 2025-2026 DeepBeepMeep - part of WanGP, WanGP Community License 2.0 (see LICENSE.txt)
+from models.help_shared import merge_help
+from .ovi_infos import OVI_HELP
 from pathlib import Path
 from typing import Any, Dict, Tuple
 
@@ -25,16 +27,12 @@ class family_handler:
         return {}
 
     @staticmethod
-    def register_lora_cli_args(parser, lora_root):
-        from .wan_handler import family_handler as wan_family_handler
-
-        return wan_family_handler.register_lora_cli_args(parser, lora_root)
-
-    @staticmethod
     def query_model_def(base_model_type: str, model_def: Dict[str, Any]):
         text_encoder_folder = "umt5-xxl"
         cfg = {
             "wan_5B_class": True,
+            "tiny_vae_architecture": "ti2v_2_2",
+            "device_explicit": True,
             "text_encoder_URLs": [
                 build_hf_url("DeepBeepMeep/Wan2.1", text_encoder_folder, "models_t5_umt5-xxl-enc-bf16.safetensors"),
                 build_hf_url("DeepBeepMeep/Wan2.1", text_encoder_folder, "models_t5_umt5-xxl-enc-quanto_int8.safetensors"),
@@ -48,8 +46,10 @@ class family_handler:
             "sliding_window": False,
             "multiple_submodels": False,
             "guidance_max_phases": 1,
-            "skip_layer_guidance": True,
+            "perturbation": True,
             "returns_audio": True,
+            "audio_window_alignment": True,
+            "audio_overlap_repair_ms": 20,  # covers the native 121-frame waveform's 17.7 ms deficit
             "sample_solvers": [
                 ("unipc", "unipc"),
                 ("dpm++", "dpm++"),
@@ -61,10 +61,11 @@ class family_handler:
             "sliding_window": True,
             "sliding_window_size_locked": True,
             "sliding_window_defaults" : { "overlap_min" : 1, "overlap_max" : 1, "overlap_step": 0, "overlap_default": 1},
-            "compile":  ["transformer", "transformer2"]
+            "compile":  ["transformer", "transformer2"],
+            "vae_block_size": 32,
         }
         cfg.update(model_def)
-        return cfg
+        return merge_help(cfg, OVI_HELP)
 
     @staticmethod
     def query_model_files(computeList, base_model_type, model_def=None):
@@ -73,19 +74,20 @@ class family_handler:
         download_def = family_handler.query_model_files(computeList, "ti2v_2_2", model_def)
         if not isinstance(download_def, list):
             download_def = [download_def]
+        bigvgan_v2_files = ["config.json", "bigvgan_generator.pt"]
         download_def  += [{
             "repoId" : "DeepBeepMeep/Wan2.1", 
-            "sourceFolderList" :  ["mmaudio", ],
-            "fileList" : [ [ "v1-16.pth", "best_netG.pt"]]   
+            "sourceFolderList" :  ["mmaudio",  "bigvgan_v2_44khz_128band_512x"],
+            "fileList" : [ [ "v1-16.pth", "best_netG.pt"], bigvgan_v2_files]   
         }]
 
         return download_def
 
     @staticmethod
-    def get_lora_dir(base_model_type, args, lora_root):
+    def get_lora_dir(base_model_type):
         from .wan_handler import family_handler as wan_family_handler
 
-        return wan_family_handler.get_lora_dir(base_model_type, args, lora_root)
+        return wan_family_handler.get_lora_dir(base_model_type)
 
     @staticmethod
     def load_model(
@@ -142,16 +144,12 @@ class family_handler:
                         "guidance_scale":  4.0,
                         "audio_guidance_scale": 3.0,
                         "num_inference_steps": 50,
-                        "slg_switch": 1,
+                        "perturbation_switch": 1,
                         "sliding_window_size": 121,
                         "video_length": 121,
-                        "slg_layers" : [11]
+                        "perturbation_layers" : [11]
         })
 
-
-    @staticmethod
-    def get_vae_block_size(base_model_type):
-        return 32
 
     @staticmethod
     def get_rgb_factors(base_model_type):

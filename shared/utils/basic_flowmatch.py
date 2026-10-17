@@ -1,3 +1,6 @@
+# Adapted from DiffSynth-Studio (https://github.com/modelscope/DiffSynth-Studio, diffsynth/schedulers/flow_match.py), Copyright (c) ModelScope,
+# Apache License 2.0 (see docs/third_party_licenses/Apache-2.0.txt). Modified for WanGP.
+# Modifications Copyright (c) 2025-2026 DeepBeepMeep - part of WanGP, WanGP Community License 2.0 (see LICENSE.txt)
 """
 The following code is copied from https://github.com/modelscope/DiffSynth-Studio/blob/main/diffsynth/schedulers/flow_match.py
 """
@@ -5,6 +8,7 @@ import torch
 
 
 class FlowMatchScheduler():
+    is_stateful = False
 
     def __init__(self, num_inference_steps=100, num_train_timesteps=1000, shift=3.0, sigma_max=1.0, sigma_min=0.003 / 1.002, inverse_timesteps=False, extra_one_step=False, reverse_sigmas=False):
         self.num_train_timesteps = num_train_timesteps
